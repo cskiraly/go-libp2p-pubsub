@@ -87,13 +87,13 @@ type extensionsState struct {
 	peerExtensions    map[peer.ID]PeerExtensions // peer's extensions
 	sentExtensions    map[peer.ID]struct{}
 	reportMisbehavior func(peer.ID)
-	sendRPC           func(p peer.ID, r *RPC, urgent bool)
+	sendRPC           func(p peer.ID, r *RPC, urgent bool) bool
 	testExtension     *testExtension
 
 	partialMessagesExtension partialMessageInterface
 }
 
-func newExtensionsState(myExtensions PeerExtensions, reportMisbehavior func(peer.ID), sendRPC func(peer.ID, *RPC, bool)) *extensionsState {
+func newExtensionsState(myExtensions PeerExtensions, reportMisbehavior func(peer.ID), sendRPC func(peer.ID, *RPC, bool) bool) *extensionsState {
 	return &extensionsState{
 		myExtensions:      myExtensions,
 		peerExtensions:    make(map[peer.ID]PeerExtensions),
@@ -305,9 +305,11 @@ func (r partialMessageRouter) MeshPeers(topic string) iter.Seq[peer.ID] {
 	}
 }
 
-// SendRPC implements partialmessages.Router.
-func (r partialMessageRouter) SendRPC(p peer.ID, rpc *pubsub_pb.PartialMessagesExtension, urgent bool) {
-	r.gs.sendRPC(p, &RPC{
+// SendRPC implements partialmessages.Router. The bool reports whether the RPC was admitted to the
+// peer's send queue, which the extension passes back to the application so it records only what
+// actually went out. See GossipSubRouter.sendRPC for why an application needs that.
+func (r partialMessageRouter) SendRPC(p peer.ID, rpc *pubsub_pb.PartialMessagesExtension, urgent bool) bool {
+	return r.gs.sendRPC(p, &RPC{
 		RPC: pubsub_pb.RPC{
 			Partial: rpc,
 		},

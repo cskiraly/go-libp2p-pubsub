@@ -41,6 +41,20 @@ type PublishAction struct {
 	// PublishPartial. Returning an error does not prevent other PublishActions
 	// from executing or affect the PeerState map.
 	Err error
+
+	// OnSent, if non-nil, is called after the send is attempted, with whether the RPC was
+	// admitted to the peer's send queue. It is called on the publishing goroutine, before the
+	// next peer's action is built, so it may safely mutate the peerStates map.
+	//
+	// It exists because an application that tracks what it has told each peer cannot recover from
+	// a silent drop. Gossipsub drops on queue pressure and relies on IHAVE being *regenerated*
+	// next heartbeat; an application's "already told them" is remembered, not regenerated, so it
+	// suppresses the retry forever. Deferring the state update into OnSent records only what
+	// actually went out.
+	//
+	// Not called when nothing is sent -- an action carrying neither cells nor metadata, or cells
+	// alone to a peer that has not requested partial messages.
+	OnSent func(admitted bool)
 }
 
 type partialMessageStatePerGroupPerTopic[P any] struct {
@@ -111,7 +125,9 @@ type PartialMessagesExtension[PeerState any] struct {
 }
 
 type Router interface {
-	SendRPC(p peer.ID, r *pb.PartialMessagesExtension, urgent bool)
+	// SendRPC reports whether the RPC was admitted to the peer's send queue. False means it was
+	// dropped before leaving this process -- typically queue pressure -- and will not arrive.
+	SendRPC(p peer.ID, r *pb.PartialMessagesExtension, urgent bool) bool
 	MeshPeers(topic string) iter.Seq[peer.ID]
 	PeerRequestsPartial(peer peer.ID, topic string) bool
 }
@@ -188,7 +204,10 @@ func (e *PartialMessagesExtension[PeerState]) publish(topic string, groupID []by
 				rpc.PartialMessage = action.EncodedPartialMessage
 			}
 			rpc.PartsMetadata = action.EncodedPartsMetadata
-			e.sendRPC(p, &rpc)
+			admitted := e.sendRPC(p, &rpc)
+			if action.OnSent != nil {
+				action.OnSent(admitted)
+			}
 		}
 	}
 	return err
@@ -302,8 +321,8 @@ func (e *PartialMessagesExtension[PeerState]) EmitGossip(topic string, peers []p
 	}
 }
 
-func (e *PartialMessagesExtension[PeerState]) sendRPC(to peer.ID, rpc *pb.PartialMessagesExtension) {
-	e.router.SendRPC(to, rpc, false)
+func (e *PartialMessagesExtension[PeerState]) sendRPC(to peer.ID, rpc *pb.PartialMessagesExtension) bool {
+	return e.router.SendRPC(to, rpc, false)
 }
 
 func (e *PartialMessagesExtension[PeerState]) HandleRPC(from peer.ID, rpc *pb.PartialMessagesExtension) error {

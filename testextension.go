@@ -6,7 +6,7 @@ import (
 )
 
 type testExtension struct {
-	sendRPC                func(p peer.ID, r *RPC, urgent bool)
+	sendRPC                func(p peer.ID, r *RPC, urgent bool) bool
 	onReceiveTestExtension func(peer.ID)
 }
 

@@ -1781,12 +1781,23 @@ func (gs *GossipSubRouter) sendPrune(p peer.ID, topic string, isUnsubscribe bool
 	gs.sendRPC(p, out, false)
 }
 
-func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC, urgent bool) {
+// sendRPC reports whether `out` was admitted to the peer's send queue.
+//
+// The result exists for the partial-messages extension, whose application state cannot be
+// corrected after the fact. Gossipsub drops a message here on queue pressure and relies on the
+// receiver learning of it through the next heartbeat's IHAVE -- a design that works because IHAVE
+// is *regenerated* rather than remembered. An application that records "I told this peer X" has no
+// such regeneration: it will not say X again, because it believes it already has. Returning
+// admission lets such an application record only what actually went out.
+//
+// Only the fate of `out` is reported. Piggybacked control and gossip are unaffected: they are
+// re-queued on drop by doDropRPC, which is the recovery this return value exists to substitute for.
+func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC, urgent bool) bool {
 	q, ok := gs.p.peers[p]
 	if !ok {
 		// No queue to send to this peer. Nothing to do.
 		gs.doDropRPC(out, p, "No send queue for peer. Can't send RPC")
-		return
+		return false
 	}
 
 	// Any pending control messages?
@@ -1827,17 +1838,23 @@ func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC, urgent bool) {
 
 	// If we're below the max message size, go ahead and send
 	if !out.exceedsSizeLimits(gs.p.maxMessageSize, gs.p.maxControlMessageSize) {
-		gs.doSendRPC(out, p, q, urgent)
-		return
+		return gs.doSendRPC(out, p, q, urgent)
 	}
 
-	// Potentially split the RPC into multiple RPCs that are below the max message size
+	// Potentially split the RPC into multiple RPCs that are below the max message size.
+	// Admitted only if every fragment was: a partially delivered message is not delivered.
+	admitted := true
 	for rpc := range out.split(gs.p.maxMessageSize, gs.p.maxControlMessageSize) {
 		if dropIfOversized(rpc) {
+			admitted = false
 			continue
 		}
-		gs.doSendRPC(rpc, p, q, urgent)
+		if !gs.doSendRPC(rpc, p, q, urgent) {
+			admitted = false
+		}
 	}
+
+	return admitted
 }
 
 func (gs *GossipSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
@@ -1850,9 +1867,12 @@ func (gs *GossipSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
 	}
 }
 
-func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, urgent bool) {
+// doSendRPC reports whether the RPC was admitted to the queue. Injected class loss counts as not
+// admitted, which is the honest answer: the RPC will not arrive, and an application that latches
+// "sent" on it would be wrong in exactly the way the failure injection is meant to expose.
+func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, urgent bool) bool {
 	if rpc = gs.applyClassLoss(rpc, p); rpc == nil {
-		return
+		return false
 	}
 	var err error
 	if urgent {
@@ -1862,9 +1882,11 @@ func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, urgent bo
 	}
 	if err != nil {
 		gs.doDropRPC(rpc, p, "queue full")
-		return
+		return false
 	}
 	gs.tracer.SendRPC(rpc, p)
+
+	return true
 }
 
 func (gs *GossipSubRouter) heartbeatTimer() {

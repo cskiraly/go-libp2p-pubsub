@@ -26,6 +26,9 @@ import (
 type testRouter struct {
 	sendRPC   func(p peer.ID, r *pubsub_pb.PartialMessagesExtension, urgent bool)
 	meshPeers func(topic string) iter.Seq[peer.ID]
+	// admitted, when set, decides what SendRPC reports. Nil means everything is admitted, which is
+	// what every pre-existing test assumes.
+	admitted func(p peer.ID, r *pubsub_pb.PartialMessagesExtension) bool
 }
 
 // PeerRequestsPartial implements Router.
@@ -33,8 +36,13 @@ func (r *testRouter) PeerRequestsPartial(peer peer.ID, topic string) bool {
 	return true
 }
 
-func (r *testRouter) SendRPC(p peer.ID, rpc *pubsub_pb.PartialMessagesExtension, urgent bool) {
+func (r *testRouter) SendRPC(p peer.ID, rpc *pubsub_pb.PartialMessagesExtension, urgent bool) bool {
 	r.sendRPC(p, rpc, urgent)
+	if r.admitted != nil {
+		return r.admitted(p, rpc)
+	}
+
+	return true
 }
 
 func (r *testRouter) MeshPeers(topic string) iter.Seq[peer.ID] {
