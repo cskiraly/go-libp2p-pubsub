@@ -592,21 +592,26 @@ type GossipSubRouter struct {
 	peers      map[peer.ID]protocol.ID // peer protocols
 	extensions *extensionsState
 
-	direct       map[peer.ID]struct{}             // direct peers
-	mesh         map[string]map[peer.ID]struct{}  // topic meshes
-	fanout       map[string]map[peer.ID]struct{}  // topic fanout
-	lastpub      map[string]int64                 // last publish time for fanout topics
-	gossip       map[peer.ID][]*pb.ControlIHave   // pending gossip
-	control      map[peer.ID]*pb.ControlMessage   // pending control messages
-	peerhave     map[peer.ID]int                  // number of IHAVEs received from peer in the last heartbeat
-	peerdontwant map[peer.ID]int                  // number of IDONTWANTs received from peer in the last heartbeat
-	unwanted     map[peer.ID]map[checksum]int     // TTL of the message ids peers don't want
-	phaseForward *phaseForwarding                 // optional push-pull phase transition on the eager-push path
-	iasked       map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
-	outbound     map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
-	backoff      map[string]map[peer.ID]time.Time // prune backoff
-	connect      chan connectInfo                 // px connection requests
-	cab          peerstore.AddrBook
+	direct         map[peer.ID]struct{}             // direct peers
+	mesh           map[string]map[peer.ID]struct{}  // topic meshes
+	fanout         map[string]map[peer.ID]struct{}  // topic fanout
+	lastpub        map[string]int64                 // last publish time for fanout topics
+	gossip         map[peer.ID][]*pb.ControlIHave   // pending gossip
+	control        map[peer.ID]*pb.ControlMessage   // pending control messages
+	peerhave       map[peer.ID]int                  // number of IHAVEs received from peer in the last heartbeat
+	peerdontwant   map[peer.ID]int                  // number of IDONTWANTs received from peer in the last heartbeat
+	unwanted       map[peer.ID]map[checksum]int     // TTL of the message ids peers don't want
+	phaseForward   *phaseForwarding                 // optional push-pull phase transition on the eager-push path
+	iwantWindow    time.Duration                    // optional one-outstanding-IWANT-per-id window
+	iwantAsked     map[string]time.Time             // message ids with an IWANT in flight, by request time
+	iwantBudgetMax int                              // optional PR-625-style per-heartbeat IWANT budget per id
+	iwantBudget    map[string]int                   // remaining budget by message id
+	phaseHolders   map[string]*phaseHolderEntry     // optional announce-fed holder tracking for phase forwarding
+	iasked         map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
+	outbound       map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
+	backoff        map[string]map[peer.ID]time.Time // prune backoff
+	connect        chan connectInfo                 // px connection requests
+	cab            peerstore.AddrBook
 
 	protos  []protocol.ID
 	feature GossipSubFeatureTest
@@ -877,11 +882,13 @@ func (gs *GossipSubRouter) AcceptFrom(p peer.ID) AcceptStatus {
 func (gs *GossipSubRouter) Preprocess(from peer.ID, msgs []*Message) {
 	tmids := make(map[string][]string)
 	for _, msg := range msgs {
+		mid := gs.p.idGen.ID(msg)
+		gs.clearIWantBudgetFor(mid)
 		if len(msg.GetData()) < gs.params.IDontWantMessageThreshold {
 			continue
 		}
 		topic := msg.GetTopic()
-		tmids[topic] = append(tmids[topic], gs.p.idGen.ID(msg))
+		tmids[topic] = append(tmids[topic], mid)
 	}
 	for topic, mids := range tmids {
 		if len(mids) == 0 {
@@ -976,6 +983,13 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 			}
 
 			if gs.p.seenMessage(mid) {
+				continue
+			}
+			gs.noteAnnouncedHolder(mid, p)
+			if !gs.iwantAllowed(mid) {
+				continue
+			}
+			if !gs.iwantBudgetAllowed(mid) {
 				continue
 			}
 			iwant[mid] = struct{}{}
@@ -1408,6 +1422,7 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 			}
 
 			if gs.phaseForward != nil && gs.phaseForward.match(topic) {
+				mid := gs.p.idGen.ID(msg)
 				cand := gmap
 				if gs.phaseForward.meshless {
 					// Meshless: every connected gossipsub-capable topic peer is a candidate,
@@ -1424,16 +1439,21 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 						if _, ok := gs.unwanted[p][csum]; ok {
 							continue
 						}
+						if gs.announcedHolder(mid, p) {
+							// A peer that announced the message holds it; neither push nor
+							// announce is owed.
+							continue
+						}
 						cand[p] = struct{}{}
 						tosend[p] = struct{}{}
 					}
 				}
 				fromSelf := from == gs.p.host.ID()
-				announce = gs.phaseForward.trim(gs, gs.p.idGen.ID(msg), csum, cand, tosend, fromSelf)
+				announce = gs.phaseForward.trim(gs, mid, csum, cand, tosend, fromSelf)
 				if fromSelf && gs.phaseForward.srcMode == PhaseSourceDelay {
 					// The source's announce is deferred, not dropped: by the time it fires,
 					// first-hop holders have announced too and absorb the pulls.
-					gs.phaseForward.scheduleDeferredIHave(gs, topic, gs.p.idGen.ID(msg), announce)
+					gs.phaseForward.scheduleDeferredIHave(gs, topic, mid, announce)
 					announce = nil
 				}
 			}
@@ -1724,6 +1744,11 @@ func (gs *GossipSubRouter) heartbeat() {
 
 	// clean up IDONTWANT counters
 	gs.clearIDontWantCounters()
+
+	// expire outstanding-IWANT records and announce-fed holder entries
+	gs.clearIWantAsked()
+	gs.resetIWantBudget()
+	gs.clearPhaseHolders()
 
 	// apply IWANT request penalties
 	gs.applyIwantPenalties()

@@ -153,6 +153,8 @@ func (pf *phaseForwarding) trim(gs *GossipSubRouter, mid string, csum checksum, 
 	for p := range gmap {
 		if _, ok := gs.unwanted[p][csum]; ok {
 			holders++
+		} else if gs.announcedHolder(mid, p) {
+			holders++
 		}
 	}
 	degree := pf.degree
@@ -257,4 +259,175 @@ func phaseRank(mid string, p peer.ID) uint64 {
 	x *= 0x94d049bb133111eb
 	x ^= x >> 31
 	return x
+}
+
+// --- IWANT discipline (independent of phase forwarding) ---
+//
+// Stock gossipsub re-requests a message id whenever another peer's IHAVE arrives while an
+// earlier IWANT is still in flight: handleIHave only checks seenMessage, which is false until
+// the payload lands. On announce-heavy paths that is the dominant duplicate source (measured
+// 2.2x received bytes on a pull-only arm). The discipline: at most one outstanding IWANT per
+// message id within a window; on expiry the next IHAVE may re-request, so a lost reply costs
+// one window rather than liveness.
+
+// WithIWantDiscipline enables one-outstanding-IWANT-per-id with the given expiry window.
+// The window must cover a round trip plus the peer's transmission of what was asked -- the
+// same sizing rule as any request timeout; sub-RTT values reintroduce the duplicates.
+func WithIWantDiscipline(window time.Duration) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("iwant discipline requires a gossipsub router")
+		}
+		if window <= 0 {
+			return fmt.Errorf("iwant discipline window must be positive")
+		}
+		gs.iwantWindow = window
+		gs.iwantAsked = make(map[string]time.Time)
+		return nil
+	}
+}
+
+// WithIWantBudget enables the upstream-PR-625 rule instead: a per-message-id IWANT budget
+// that the heartbeat resets wholesale and message arrival clears. Same intent as the
+// discipline, different retry clock -- the budget re-opens at the next heartbeat *boundary*,
+// the discipline's window a fixed interval after the request. Built for a measured
+// head-to-head; enable one or the other, not both.
+func WithIWantBudget(n int) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("iwant budget requires a gossipsub router")
+		}
+		if n <= 0 {
+			return fmt.Errorf("iwant budget must be positive")
+		}
+		gs.iwantBudgetMax = n
+		gs.iwantBudget = make(map[string]int)
+		return nil
+	}
+}
+
+// iwantBudgetAllowed mirrors PR 625's allowedIWantCount check, consuming one unit.
+func (gs *GossipSubRouter) iwantBudgetAllowed(mid string) bool {
+	if gs.iwantBudget == nil {
+		return true
+	}
+	n, ok := gs.iwantBudget[mid]
+	if !ok {
+		n = gs.iwantBudgetMax
+	}
+	if n <= 0 {
+		return false
+	}
+	gs.iwantBudget[mid] = n - 1
+	return true
+}
+
+// resetIWantBudget discards all budget state; called from the heartbeat (PR 625 semantics).
+func (gs *GossipSubRouter) resetIWantBudget() {
+	if len(gs.iwantBudget) > 0 {
+		gs.iwantBudget = make(map[string]int)
+	}
+}
+
+// clearIWantBudgetFor drops the id on message arrival (PR 625's Preprocess delete).
+func (gs *GossipSubRouter) clearIWantBudgetFor(mid string) {
+	if gs.iwantBudget != nil {
+		delete(gs.iwantBudget, mid)
+	}
+}
+
+// iwantAllowed reports whether an IWANT for mid may be issued now, recording it if so.
+// Runs on pubsub's goroutine, like every router map.
+func (gs *GossipSubRouter) iwantAllowed(mid string) bool {
+	if gs.iwantAsked == nil {
+		return true
+	}
+	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
+		return false
+	}
+	gs.iwantAsked[mid] = time.Now()
+	return true
+}
+
+// clearIWantAsked drops expired outstanding-request records; called from the heartbeat.
+func (gs *GossipSubRouter) clearIWantAsked() {
+	if gs.iwantAsked == nil {
+		return
+	}
+	for mid, at := range gs.iwantAsked {
+		if time.Since(at) >= gs.iwantWindow {
+			delete(gs.iwantAsked, mid)
+		}
+	}
+}
+
+// --- Announce-fed holder tracking (for phase forwarding) ---
+//
+// The phase decay's holder estimate is IDONTWANT-fed, and IDONTWANT only reaches mesh peers
+// -- which is exactly what broke the first meshless attempt (Q21): off-mesh candidates never
+// registered as holders, so the decay never fired. Announces are the wider signal: a peer
+// that sent us an IHAVE for a message id holds it. Opt-in, because it changes the measured
+// behaviour of the existing phase arms.
+
+// WithPhaseAnnounceHolders feeds received IHAVEs into phase forwarding's holder estimate.
+func WithPhaseAnnounceHolders() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("announce holders requires a gossipsub router")
+		}
+		if gs.phaseForward == nil {
+			return fmt.Errorf("announce holders requires WithPhaseForwarding first")
+		}
+		gs.phaseHolders = make(map[string]*phaseHolderEntry)
+		return nil
+	}
+}
+
+type phaseHolderEntry struct {
+	peers map[peer.ID]struct{}
+	added time.Time
+}
+
+// noteAnnouncedHolder records that p announced mid. Bounded by the heartbeat pruning below
+// and by gossipsub's own caps on how many IHAVE ids a peer may advertise per heartbeat.
+func (gs *GossipSubRouter) noteAnnouncedHolder(mid string, p peer.ID) {
+	if gs.phaseHolders == nil {
+		return
+	}
+	e, ok := gs.phaseHolders[mid]
+	if !ok {
+		e = &phaseHolderEntry{peers: make(map[peer.ID]struct{}), added: time.Now()}
+		gs.phaseHolders[mid] = e
+	}
+	e.peers[p] = struct{}{}
+}
+
+// announcedHolder reports whether p is known (via IHAVE) to hold mid.
+func (gs *GossipSubRouter) announcedHolder(mid string, p peer.ID) bool {
+	if gs.phaseHolders == nil {
+		return false
+	}
+	e, ok := gs.phaseHolders[mid]
+	if !ok {
+		return false
+	}
+	_, held := e.peers[p]
+	return held
+}
+
+// clearPhaseHolders drops holder entries older than the retention window; called from the
+// heartbeat. Six heartbeats matches the mcache history a message stays serveable for.
+func (gs *GossipSubRouter) clearPhaseHolders() {
+	if gs.phaseHolders == nil {
+		return
+	}
+	cutoff := 6 * gs.params.HeartbeatInterval
+	for mid, e := range gs.phaseHolders {
+		if time.Since(e.added) >= cutoff {
+			delete(gs.phaseHolders, mid)
+		}
+	}
 }
