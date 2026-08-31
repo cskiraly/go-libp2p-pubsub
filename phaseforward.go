@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 	"math/rand"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
@@ -243,6 +244,241 @@ func (pf *phaseForwarding) scheduleDeferredIHave(gs *GossipSubRouter, topic, mid
 		case <-gs.p.ctx.Done():
 		}
 	})
+}
+
+// --- F1 withholding injection (measurement-plan section 15) ---
+
+// WithIWantWithholding makes this node answer IWANTs never (delay 0 = silent) or whole
+// after a fixed delay. Announcing is untouched -- IHAVE, IDONTWANT and mesh behaviour all
+// continue -- which is the adversarial announce-without-serving case; a crashed peer is
+// F3's job. The counter, when non-nil, records the ids withheld or delayed, so injected
+// exposure is verified rather than assumed.
+func WithIWantWithholding(delay time.Duration, withheld *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("iwant withholding requires a gossipsub router")
+		}
+		if delay < 0 {
+			return fmt.Errorf("iwant withholding delay must be zero (silent) or positive (slow)")
+		}
+		gs.withholdServe = true
+		gs.withholdDelay = delay
+		gs.withheldServes = withheld
+		return nil
+	}
+}
+
+// withholdIWantServe applies the injection to a built reply: swallow it (silent) or send
+// it whole after the delay, on pubsub's own goroutine like every router action.
+func (gs *GossipSubRouter) withholdIWantServe(p peer.ID, msgs []*pb.Message) {
+	if gs.withheldServes != nil {
+		gs.withheldServes.Add(int64(len(msgs)))
+	}
+	if gs.withholdDelay <= 0 {
+		return
+	}
+	time.AfterFunc(gs.withholdDelay, func() {
+		select {
+		case gs.p.eval <- func() {
+			if _, ok := gs.p.peers[p]; !ok {
+				return
+			}
+			gs.sendRPC(p, rpcWithControl(msgs, nil, nil, nil, nil, nil), false)
+		}:
+		case <-gs.p.ctx.Done():
+		}
+	})
+}
+
+// --- F2a per-class admission loss (measurement-plan section 15) ---
+//
+// Models gossipsub's real failure mode -- RPC content shed at queue admission, never
+// retransmitted -- one control class at a time, so a run can attribute which mechanism a
+// lost class breaks: a lost IDONTWANT costs duplicates, a lost IHAVE/IWANT or data message
+// costs liveness. Entries are stripped at doSendRPC, after splitting and piggybacking.
+// Decisions are stateless: hash(node seed, class, message id, destination's stable address)
+// -- so the schedule is identical across arms that share semantic units, and does not
+// depend on arm-specific call order (the section 15 CRN rule).
+
+const (
+	lossClassNone uint8 = iota
+	lossClassIHave
+	lossClassIWant
+	lossClassIDontWant
+	lossClassData
+)
+
+// WithRPCClassLoss drops pct percent of the given class ("ihave", "iwant", "idontwant",
+// "data") at queue admission. nodeSeed comes from the harness (fail seed x node index);
+// dropped, when non-nil, counts stripped entries so exposure is verified.
+func WithRPCClassLoss(class string, pct int, nodeSeed uint64, dropped *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("rpc class loss requires a gossipsub router")
+		}
+		if pct <= 0 || pct >= 100 {
+			return fmt.Errorf("rpc class loss pct must be in (0,100)")
+		}
+		switch class {
+		case "ihave":
+			gs.lossClass = lossClassIHave
+		case "iwant":
+			gs.lossClass = lossClassIWant
+		case "idontwant":
+			gs.lossClass = lossClassIDontWant
+		case "data":
+			gs.lossClass = lossClassData
+		default:
+			return fmt.Errorf("unknown rpc loss class %q", class)
+		}
+		gs.lossPct = pct
+		gs.lossSeed = nodeSeed
+		gs.lossDropped = dropped
+		return nil
+	}
+}
+
+// lossDecide is the stateless drop decision for one semantic unit.
+func (gs *GossipSubRouter) lossDecide(id string, dst peer.ID) bool {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte{byte(gs.lossClass)})
+	_, _ = h.Write([]byte(id))
+	_, _ = h.Write([]byte(gs.stablePeerKey(dst)))
+	x := h.Sum64() ^ gs.lossSeed
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return int(x%100) < gs.lossPct
+}
+
+// applyClassLoss returns the RPC to send toward dst with the configured class's losses
+// applied, or nil when the loss consumed everything the RPC carried.
+//
+// The input RPC is never mutated. The forwarding path yields one *RPC to every push
+// recipient, so an in-place filter would let the first peer's loss decision rewrite what
+// every later peer receives -- per-peer loss would silently become correlated loss. When a
+// drop occurs, a fresh RPC is built field by field rather than by copying the value:
+// pb.RPC embeds protobuf state that carries a mutex.
+func (gs *GossipSubRouter) applyClassLoss(rpc *RPC, dst peer.ID) *RPC {
+	if gs.lossClass == lossClassNone || rpc == nil {
+		return rpc
+	}
+	dropped := int64(0)
+	out := rpc
+	switch gs.lossClass {
+	case lossClassData:
+		if len(rpc.Publish) == 0 {
+			return rpc
+		}
+		kept := make([]*pb.Message, 0, len(rpc.Publish))
+		for _, m := range rpc.Publish {
+			if gs.lossDecide(gs.p.idGen.ID(&Message{Message: m}), dst) {
+				dropped++
+				continue
+			}
+			kept = append(kept, m)
+		}
+		if dropped == 0 {
+			return rpc
+		}
+		out = &RPC{from: rpc.from}
+		out.Subscriptions = rpc.Subscriptions
+		out.Control = rpc.Control
+		out.Publish = kept
+	case lossClassIHave, lossClassIWant, lossClassIDontWant:
+		ctl := rpc.GetControl()
+		if ctl == nil {
+			return rpc
+		}
+		filterIDs := func(ids []string) ([]string, int64) {
+			var n int64
+			kept := make([]string, 0, len(ids))
+			for _, id := range ids {
+				if gs.lossDecide(id, dst) {
+					n++
+					continue
+				}
+				kept = append(kept, id)
+			}
+			return kept, n
+		}
+		newCtl := &pb.ControlMessage{
+			Ihave:     ctl.Ihave,
+			Iwant:     ctl.Iwant,
+			Graft:     ctl.Graft,
+			Prune:     ctl.Prune,
+			Idontwant: ctl.Idontwant,
+		}
+		switch gs.lossClass {
+		case lossClassIHave:
+			entries := make([]*pb.ControlIHave, len(ctl.Ihave))
+			for i, e := range ctl.Ihave {
+				kept, n := filterIDs(e.MessageIDs)
+				if n == 0 {
+					entries[i] = e
+					continue
+				}
+				dropped += n
+				entries[i] = &pb.ControlIHave{TopicID: e.TopicID, MessageIDs: kept}
+			}
+			newCtl.Ihave = entries
+		case lossClassIWant:
+			entries := make([]*pb.ControlIWant, len(ctl.Iwant))
+			for i, e := range ctl.Iwant {
+				kept, n := filterIDs(e.MessageIDs)
+				if n == 0 {
+					entries[i] = e
+					continue
+				}
+				dropped += n
+				entries[i] = &pb.ControlIWant{MessageIDs: kept}
+			}
+			newCtl.Iwant = entries
+		case lossClassIDontWant:
+			entries := make([]*pb.ControlIDontWant, len(ctl.Idontwant))
+			for i, e := range ctl.Idontwant {
+				kept, n := filterIDs(e.MessageIDs)
+				if n == 0 {
+					entries[i] = e
+					continue
+				}
+				dropped += n
+				entries[i] = &pb.ControlIDontWant{MessageIDs: kept}
+			}
+			newCtl.Idontwant = entries
+		}
+		if dropped == 0 {
+			return rpc
+		}
+		out = &RPC{from: rpc.from}
+		out.Subscriptions = rpc.Subscriptions
+		out.Publish = rpc.Publish
+		out.Control = newCtl
+	}
+	if gs.lossDropped != nil {
+		gs.lossDropped.Add(dropped)
+	}
+	if len(out.Publish) == 0 && out.GetControl() != nil {
+		ctl := out.GetControl()
+		empty := true
+		for _, e := range ctl.Ihave {
+			empty = empty && len(e.MessageIDs) == 0
+		}
+		for _, e := range ctl.Iwant {
+			empty = empty && len(e.MessageIDs) == 0
+		}
+		for _, e := range ctl.Idontwant {
+			empty = empty && len(e.MessageIDs) == 0
+		}
+		if empty && len(ctl.Graft) == 0 && len(ctl.Prune) == 0 {
+			return nil
+		}
+	}
+	return out
 }
 
 // phaseRank scores one (message, peer) pair. FNV-1a avalanched with the splitmix64

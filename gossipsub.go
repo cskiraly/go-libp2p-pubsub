@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"slices"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
@@ -607,6 +608,13 @@ type GossipSubRouter struct {
 	iwantBudgetMax int                              // optional PR-625-style per-heartbeat IWANT budget per id
 	iwantBudget    map[string]int                   // remaining budget by message id
 	rng            *rand.Rand                       // optional seeded shuffle source (deterministic mode)
+	withholdServe  bool                             // F1 injection: never/late IWANT service
+	withholdDelay  time.Duration                    // 0 = silent, >0 = serve whole after delay
+	withheldServes *atomic.Int64                    // verified-exposure counter, may be nil
+	lossClass      uint8                            // F2a injection: which class is shed at admission
+	lossPct        int                              // drop probability, percent
+	lossSeed       uint64                           // per-node seed from the harness
+	lossDropped    *atomic.Int64                    // verified-exposure counter, may be nil
 	phaseHolders   map[string]*phaseHolderEntry     // optional announce-fed holder tracking for phase forwarding
 	iasked         map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
 	outbound       map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
@@ -1068,6 +1076,11 @@ func (gs *GossipSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb.
 	msgs := make([]*pb.Message, 0, len(ihave))
 	for _, msg := range ihave {
 		msgs = append(msgs, msg)
+	}
+
+	if gs.withholdServe {
+		gs.withholdIWantServe(p, msgs)
+		return nil
 	}
 
 	return msgs
@@ -1678,6 +1691,9 @@ func (gs *GossipSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
 }
 
 func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, urgent bool) {
+	if rpc = gs.applyClassLoss(rpc, p); rpc == nil {
+		return
+	}
 	var err error
 	if urgent {
 		err = q.UrgentPush(rpc, false)
