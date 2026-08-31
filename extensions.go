@@ -276,9 +276,27 @@ func (r partialMessageRouter) MeshPeers(topic string) iter.Seq[peer.ID] {
 			peerSet = r.gs.getFanoutPeersForPublishing(topic)
 		}
 
+		wants := func(peer peer.ID) bool {
+			return r.gs.extensions.peerExtensions[peer].PartialMessages &&
+				(r.gs.iRequestPartial(topic) && r.gs.peerSupportsSendingPartial(peer, topic)) || (r.gs.iSupportSendingPartial(topic) && r.gs.peerRequestsPartial(peer, topic))
+		}
+
 		for peer := range peerSet {
-			if r.gs.extensions.peerExtensions[peer].PartialMessages &&
-				(r.gs.iRequestPartial(topic) && r.gs.peerSupportsSendingPartial(peer, topic)) || (r.gs.iSupportSendingPartial(topic) && r.gs.peerRequestsPartial(peer, topic)) {
+			if wants(peer) {
+				if !yield(peer) {
+					return
+				}
+			}
+		}
+
+		// Peers that declared partial interest without subscribing are in neither the mesh nor
+		// the fanout set -- both are built from the topic's subscribers. They asked to be sent
+		// partial messages on this topic, so this is the only place they can be reached.
+		for peer := range r.gs.p.partialInterestPeers(topic) {
+			if _, alreadySeen := peerSet[peer]; alreadySeen {
+				continue
+			}
+			if wants(peer) {
 				if !yield(peer) {
 					return
 				}

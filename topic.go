@@ -136,6 +136,54 @@ func (t *Topic) EventHandler(opts ...TopicEventHandlerOpt) (*TopicEventHandler, 
 	return h, nil
 }
 
+// SetPartialInterest announces to our peers whether we request partial messages on this topic
+// without being subscribed to it.
+//
+// This is for a topic joined for its partial-message traffic alone: `Join` gives you the local
+// half -- you can send partial messages on the topic -- but the flags that let a peer send them
+// *to* you are carried only in a subscribe announcement, so a joined-but-unsubscribed topic can
+// never be seen as requesting partials. Subscribing instead would be a lie with consequences:
+// peers would graft us into the topic mesh and forward us full messages we did not ask for.
+//
+// The announcement carries subscribe=false, so a peer that does not implement this reads it as an
+// ordinary unsubscribe and simply does not serve us -- the feature degrades to its absence rather
+// than to a protocol error.
+//
+// It is an error to call this on a topic joined without a partial-messages option (nothing to
+// announce), or on a topic we are subscribed to or relaying: the announcement carries
+// subscribe=false, which on a subscribed topic would tell peers to stop sending us the messages we
+// subscribed for.
+func (t *Topic) SetPartialInterest(ctx context.Context, interested bool) error {
+	t.mux.RLock()
+	defer t.mux.RUnlock()
+	if t.closed {
+		return ErrTopicClosed
+	}
+	if interested && !t.requestPartialMessages && !t.supportsPartialMessages {
+		return errors.New("topic was not joined with a partial messages option")
+	}
+
+	result := make(chan error, 1)
+	select {
+	case t.p.eval <- func() {
+		result <- t.p.announcePartialInterest(t.topic, interested)
+	}:
+	case <-t.p.ctx.Done():
+		return t.p.ctx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case err := <-result:
+		return err
+	case <-t.p.ctx.Done():
+		return t.p.ctx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (t *Topic) sendNotification(evt PeerEvent) {
 	t.evtHandlerMux.RLock()
 	defer t.evtHandlerMux.RUnlock()

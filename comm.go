@@ -49,6 +49,28 @@ func (p *PubSub) getHelloPacket() *RPC {
 		}
 		rpc.Subscriptions = append(rpc.Subscriptions, as)
 	}
+
+	// Partial interest in topics we joined but did not subscribe to. Sent with subscribe=false,
+	// so a peer that does not implement it reads a no-op unsubscribe. Without this the interest
+	// would be lost on every new stream, since it is announced once when set.
+	for t := range p.myPartialInterest {
+		if subscriptions[t] {
+			// A subscription already carries the partial flags and supersedes the interest.
+			continue
+		}
+		var requestPartial, supportsPartialMessages bool
+		if ts, ok := p.myTopics[t]; ok {
+			requestPartial = ts.requestPartialMessages
+			supportsPartialMessages = ts.supportsPartialMessages
+		}
+		rpc.Subscriptions = append(rpc.Subscriptions, &pb.RPC_SubOpts{
+			Topicid:                proto.String(t),
+			Subscribe:              proto.Bool(false),
+			RequestsPartial:        &requestPartial,
+			SupportsSendingPartial: &supportsPartialMessages,
+		})
+	}
+
 	return &rpc
 }
 

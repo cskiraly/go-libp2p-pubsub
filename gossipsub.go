@@ -1580,13 +1580,29 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 }
 
 func (gs *GossipSubRouter) peerSupportsSendingPartial(p peer.ID, topic string) bool {
-	peerStates, ok := gs.p.topics[topic]
-	return ok && gs.extensions.myExtensions.PartialMessages && peerStates[p].supportsPartial
+	if !gs.extensions.myExtensions.PartialMessages {
+		return false
+	}
+	if peerStates, ok := gs.p.topics[topic]; ok && peerStates[p].supportsPartial {
+		return true
+	}
+	// A peer may declare partial interest in a topic it is not subscribed to; see
+	// PubSub.announcePartialInterest.
+	state, ok := gs.p.partialInterestState(topic, p)
+
+	return ok && state.supportsPartial
 }
 
 func (gs *GossipSubRouter) peerRequestsPartial(p peer.ID, topic string) bool {
-	peerStates, ok := gs.p.topics[topic]
-	return ok && gs.extensions.myExtensions.PartialMessages && peerStates[p].requestsPartial
+	if !gs.extensions.myExtensions.PartialMessages {
+		return false
+	}
+	if peerStates, ok := gs.p.topics[topic]; ok && peerStates[p].requestsPartial {
+		return true
+	}
+	state, ok := gs.p.partialInterestState(topic, p)
+
+	return ok && state.requestsPartial
 }
 
 func (gs *GossipSubRouter) iSupportSendingPartial(topic string) bool {
