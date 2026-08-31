@@ -257,11 +257,18 @@ func (e *PartialMessagesExtension[PeerState]) Heartbeat() {
 		for group, gState := range tState {
 			if gState.groupTTL == 0 || len(gState.peerState) == 0 {
 				delete(tState, group)
-				if len(tState) == 0 {
-					delete(e.statePerTopicPerGroup, topic)
-				}
 				if gState.remotePeerInitiated() {
 					e.peerInitiatedGroupCounter[topic].Dec(gState.initiatedBy)
+				}
+				if len(tState) == 0 {
+					delete(e.statePerTopicPerGroup, topic)
+					// Drop the counter with the state it counts. Both maps are keyed by a
+					// peer-controlled topic string, so leaving the counter behind lets a peer
+					// grow one map entry per topic it names, for the process lifetime, even
+					// though every group under it has expired.
+					//
+					// Note the Dec above has to happen first: it reads the entry.
+					delete(e.peerInitiatedGroupCounter, topic)
 				}
 			} else {
 				gState.groupTTL--

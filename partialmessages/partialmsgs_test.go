@@ -1217,10 +1217,21 @@ func TestPeerInitiatedCounter(t *testing.T) {
 
 	assertCounts := func(expectedTotal int, expectedMap map[peer.ID]int) {
 		t.Helper()
-		if handler.peerInitiatedGroupCounter[topic].total != expectedTotal {
+		ctr, ok := handler.peerInitiatedGroupCounter[topic]
+		if !ok {
+			// A missing entry is zero. The heartbeat drops the counter along with the last
+			// group state under its topic, because both maps are keyed by a peer-controlled
+			// topic string and leaving the counter behind lets a peer grow one entry per topic
+			// it names for the process lifetime.
+			if expectedTotal != 0 || len(expectedMap) != 0 {
+				t.Fatalf("no counter for %q, expected total %d and %v", topic, expectedTotal, expectedMap)
+			}
+			return
+		}
+		if ctr.total != expectedTotal {
 			t.Fatal()
 		}
-		if !reflect.DeepEqual(handler.peerInitiatedGroupCounter[topic].perPeer, expectedMap) {
+		if !reflect.DeepEqual(ctr.perPeer, expectedMap) {
 			t.Fatal()
 		}
 	}

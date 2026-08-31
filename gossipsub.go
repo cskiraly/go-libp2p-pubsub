@@ -623,6 +623,9 @@ type GossipSubRouter struct {
 	lossSeed       uint64                           // per-node seed from the harness
 	lossDropped    *atomic.Int64                    // verified-exposure counter, may be nil
 	phaseHolders   map[string]*phaseHolderEntry     // optional announce-fed holder tracking for phase forwarding
+	requestGate    RequestGate                      // optional application veto on requesting an announced id
+	deferred       map[string]*deferredEntry        // declined announcements, replayable when the gate opens
+	deferredMax    int                              // cap on deferred entries
 	iasked         map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
 	outbound       map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
 	backoff        map[string]map[peer.ID]time.Time // prune backoff
@@ -978,7 +981,10 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 		return nil
 	}
 
-	iwant := make(map[string]struct{})
+	// iwant is the dedup set, and doubles as the id-to-topic map the request gate needs: an id
+	// announced under several topics keeps the first, which is the one that admitted it.
+	iwant := make(map[string]string)
+	candidates := make([]string, 0, 32)
 	for _, ihave := range ctl.GetIhave() {
 		topic := ihave.GetTopicID()
 		_, ok := gs.mesh[topic]
@@ -1002,50 +1008,93 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 				continue
 			}
 			gs.noteAnnouncedHolder(mid, p)
-			if gs.nqg != nil {
-				// (N,q,g) kernel owns the request decision when enabled.
-				if !gs.nqgAllowed(mid, p) {
-					continue
-				}
-				iwant[mid] = struct{}{}
+			if _, dup := iwant[mid]; dup {
 				continue
 			}
-			if !gs.iwantAllowed(mid) {
-				continue
-			}
-			if !gs.iwantBudgetAllowed(mid) {
-				continue
-			}
-			iwant[mid] = struct{}{}
+			iwant[mid] = topic
+			candidates = append(candidates, mid)
 		}
 	}
 
-	if len(iwant) == 0 {
+	if len(candidates) == 0 {
 		return nil
 	}
 
-	iask := len(iwant)
-	if iask+gs.iasked[p] > gs.params.MaxIHaveLength {
-		iask = gs.params.MaxIHaveLength - gs.iasked[p]
+	// Decide the per-peer allowance before consulting any request policy. The policies below
+	// record state as a side effect of allowing an id, so selecting more ids than we will send
+	// and truncating afterwards would leave phantom entries: an id marked as requested that no
+	// IWANT ever carried, suppressed until its window expires. Shuffling the candidates here
+	// rather than the selected list keeps the anti-gaming property -- a peer cannot steer which
+	// ids we ask for by ordering its IHAVE -- while making selection and dispatch the same set.
+	allowance := gs.params.MaxIHaveLength - gs.iasked[p]
+	if allowance <= 0 {
+		return nil
+	}
+	gs.shuffleStrings(candidates)
+
+	iwantlst := gs.selectIWants(candidates, iwant, p, allowance)
+	if len(iwantlst) == 0 {
+		return nil
 	}
 
-	gs.logger.Debug("IHAVE: Asking for messages from peer", "asking", iask, "total", len(iwant), "peer", p)
-
-	iwantlst := make([]string, 0, len(iwant))
-	for mid := range iwant {
-		iwantlst = append(iwantlst, mid)
-	}
-
-	// ask in random order
-	gs.shuffleStrings(iwantlst)
-
-	// truncate to the messages we are actually asking for and update the iasked counter
-	iwantlst = iwantlst[:iask]
-	gs.iasked[p] += iask
+	gs.logger.Debug("IHAVE: Asking for messages from peer", "asking", len(iwantlst), "candidates", len(candidates), "peer", p)
+	gs.iasked[p] += len(iwantlst)
 
 	gs.gossipTracer.AddPromise(p, iwantlst)
+	if gs.requestGate != nil {
+		// Only the dispatched set is reported, so an application budget is charged for requests
+		// that were actually made rather than for ids a later policy refused.
+		gs.requestGate.Committed(p, iwantlst)
+	}
 
 	return []*pb.ControlIWant{{MessageIDs: iwantlst}}
+}
+
+// selectIWants picks at most allowance ids from candidates, consulting the active request
+// policy in order.
+//
+// Selection and dispatch are the same set by construction, and that is the point: each policy
+// records state as a side effect of allowing an id, so a caller that selected freely and
+// truncated afterwards would leave phantom entries -- ids marked as requested that no IWANT
+// ever carried, suppressed until their window expired. Callers must therefore shuffle
+// candidates *before* calling this, not the result after.
+//
+// The application request gate runs FIRST, ahead of every policy, and that ordering is
+// load-bearing rather than stylistic. The policies below mutate their ledgers when they allow an
+// id; a gate placed after any of them would burn the id on every decline, so an application that
+// declines now and wants the same id later -- the block-authority case -- could never come back
+// for it. Ahead of them, a decline touches nothing and is retryable. topicOf maps each candidate
+// to the topic it was announced under; it may be nil when no gate is installed.
+func (gs *GossipSubRouter) selectIWants(candidates []string, topicOf map[string]string, p peer.ID, allowance int) []string {
+	if allowance <= 0 {
+		return nil
+	}
+	out := make([]string, 0, min(len(candidates), allowance))
+	for _, mid := range candidates {
+		if len(out) >= allowance {
+			break
+		}
+		if gs.requestGate != nil && !gs.requestGate.Allow(p, topicOf[mid], mid) {
+			gs.noteDeclined(p, topicOf[mid], mid)
+			continue
+		}
+		if gs.nqg != nil {
+			// (N,q,g) kernel owns the request decision when enabled.
+			if !gs.nqgAllowed(mid, p) {
+				continue
+			}
+			out = append(out, mid)
+			continue
+		}
+		if !gs.iwantAllowed(mid) {
+			continue
+		}
+		if !gs.iwantBudgetAllowed(mid) {
+			continue
+		}
+		out = append(out, mid)
+	}
+	return out
 }
 
 func (gs *GossipSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb.Message {
