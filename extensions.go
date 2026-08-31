@@ -2,6 +2,7 @@ package pubsub
 
 import (
 	"errors"
+	"fmt"
 	"iter"
 
 	"github.com/libp2p/go-libp2p-pubsub/partialmessages"
@@ -80,6 +81,11 @@ type partialMessageInterface interface {
 	HandleRPC(from peer.ID, rpc *pubsub_pb.PartialMessagesExtension) error
 	Heartbeat()
 	EmitGossip(topic string, peers []peer.ID)
+	// RegisteredTopics lets the heartbeat gossip topics that hold registered
+	// (advertisement-only) partial state without being in the mesh or the fanout -- the
+	// joined-contributor case (RegisterPartial), where no other path would ever announce
+	// the state.
+	RegisteredTopics() []string
 }
 
 type extensionsState struct {
@@ -212,6 +218,54 @@ func WithPartialMessagesExtension[PeerState any](pm *partialmessages.PartialMess
 		gs.extensions.myExtensions.PartialMessages = true
 		gs.extensions.partialMessagesExtension = pm
 		return nil
+	}
+}
+
+// RegisterPartial registers self-initiated partial-message state for a group without contacting
+// anyone: the heartbeat announces it (see RegisteredTopics) and incoming requests are served
+// from it like any published group. The advertisement-only counterpart of PublishPartial.
+// A standalone function rather than a method on PubSub due to the generic type parameter.
+func RegisterPartial[PeerState any](ps *PubSub, topic string, groupID []byte) error {
+	resp := make(chan error, 1)
+	select {
+	case <-ps.ctx.Done():
+		return ps.ctx.Err()
+	case ps.eval <- func() {
+		defer close(resp)
+
+		rt, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			resp <- errors.New("partial publishing is only supported by the GossipSub router")
+			return
+		}
+
+		if rt.extensions.partialMessagesExtension == nil {
+			resp <- errors.New("partial publishing is not enabled")
+			return
+		}
+		pme, ok := rt.extensions.partialMessagesExtension.(*partialmessages.PartialMessagesExtension[PeerState])
+		if !ok {
+			resp <- errors.New("incompatible partial messages extension type")
+			return
+		}
+
+		// Registered state is announced by heartbeat gossip on joined topics and served to
+		// peers that request partial messages there. On an unjoined topic neither happens:
+		// the state would sit invisible until its TTL, which is a caller bug worth naming.
+		if !rt.iSupportSendingPartial(topic) {
+			resp <- fmt.Errorf("cannot register partial state: topic %s is not joined with partial-message support", topic)
+			return
+		}
+
+		resp <- pme.RegisterPartial(topic, groupID)
+	}:
+	}
+
+	select {
+	case <-ps.ctx.Done():
+		return ps.ctx.Err()
+	case r := <-resp:
+		return r
 	}
 }
 

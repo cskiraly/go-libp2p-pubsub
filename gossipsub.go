@@ -2181,6 +2181,23 @@ func (gs *GossipSubRouter) heartbeat() {
 		gs.emitGossip(topic, peers)
 	}
 
+	// Gossip topics that hold registered (advertisement-only) partial-message state without
+	// being in the mesh or the fanout: a joined-but-unsubscribed contributor
+	// (partialmessages.RegisterPartial) is in neither, and this is the only path that ever
+	// announces its state. The message cache has nothing for such a topic, so emitGossip
+	// sends no IHAVE and only the partial-messages extension's gossip runs.
+	if gs.extensions.partialMessagesExtension != nil {
+		for _, topic := range gs.extensions.partialMessagesExtension.RegisteredTopics() {
+			if _, inMesh := gs.mesh[topic]; inMesh {
+				continue
+			}
+			if _, inFanout := gs.fanout[topic]; inFanout {
+				continue
+			}
+			gs.emitGossip(topic, nil)
+		}
+	}
+
 	// send coalesced GRAFT/PRUNE messages (will piggyback gossip)
 	gs.sendGraftPrune(tograft, toprune, noPX)
 

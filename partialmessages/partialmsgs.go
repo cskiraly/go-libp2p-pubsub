@@ -61,6 +61,10 @@ type partialMessageStatePerGroupPerTopic[P any] struct {
 	peerState   map[peer.ID]P
 	groupTTL    int
 	initiatedBy peer.ID // zero value if we initiated the group
+	// registered marks state created by RegisterPartial: advertisement-only groups whose
+	// retention and heartbeat gossip differ from published state. PublishPartial groups
+	// keep upstream semantics.
+	registered bool
 }
 
 func newPartialMessageStatePerTopicGroup[P any](groupTTL int) *partialMessageStatePerGroupPerTopic[P] {
@@ -249,6 +253,24 @@ func (e *PartialMessagesExtension[PeerState]) PublishPartial(topic string, group
 	))
 }
 
+// RegisterPartial creates (or refreshes the TTL of) self-initiated state for a group without
+// contacting anyone. The state is announced by heartbeat gossip (EmitGossip) and serves incoming
+// requests exactly like a published group; what it never does is spend a burst of first-contact
+// sends at registration time. It is the advertisement-only alternative to PublishPartial for a
+// contributor whose data is a fallback rather than the primary path -- the router's heartbeat
+// gossips joined topics that hold self-initiated state, so registration alone is enough to be
+// discovered, at gossip cadence.
+func (e *PartialMessagesExtension[PeerState]) RegisterPartial(topic string, groupID []byte) error {
+	gState, err := e.groupState(topic, groupID, false, "")
+	if err != nil {
+		return err
+	}
+	gState.groupTTL = max(e.GroupTTLByHeatbeat, minGroupTTL)
+	gState.registered = true
+
+	return nil
+}
+
 // initPeerState initializes the peer state of MeshPeers that aren't already in
 // our peerState map.
 func (e *PartialMessagesExtension[PeerState]) initPeerState(topic string, gState *partialMessageStatePerGroupPerTopic[PeerState]) {
@@ -274,7 +296,13 @@ func (e *PartialMessagesExtension[PeerState]) OnClosedOutboundStream(id peer.ID)
 func (e *PartialMessagesExtension[PeerState]) Heartbeat() {
 	for topic, tState := range e.statePerTopicPerGroup {
 		for group, gState := range tState {
-			if gState.groupTTL == 0 || len(gState.peerState) == 0 {
+			// An empty peer map ends a group early -- every stream that carried it is gone.
+			// Registered state (RegisterPartial) is the one exception and lives on its TTL
+			// alone: an advertisement-only group legitimately has no tracked peers until
+			// heartbeat gossip finds some, and deleting it here would kill the advertisement
+			// before its first emission. Published groups keep upstream retention, so
+			// enabling RegisterPartial changes nothing for code that never calls it.
+			if gState.groupTTL == 0 || (len(gState.peerState) == 0 && !gState.registered) {
 				delete(tState, group)
 				if gState.remotePeerInitiated() {
 					e.peerInitiatedGroupCounter[topic].Dec(gState.initiatedBy)
@@ -294,6 +322,25 @@ func (e *PartialMessagesExtension[PeerState]) Heartbeat() {
 			}
 		}
 	}
+}
+
+// RegisteredTopics reports the topics holding at least one group of registered
+// (advertisement-only) state. The router's heartbeat gossips these even when they are in
+// neither the mesh nor the fanout -- the joined-contributor case, where nothing else would
+// ever announce the state. Published groups are excluded: their topics are announced by the
+// ordinary mesh and fanout gossip.
+func (e *PartialMessagesExtension[PeerState]) RegisteredTopics() []string {
+	topics := make([]string, 0, len(e.statePerTopicPerGroup))
+	for topic, tState := range e.statePerTopicPerGroup {
+		for _, gState := range tState {
+			if gState.registered {
+				topics = append(topics, topic)
+				break
+			}
+		}
+	}
+
+	return topics
 }
 
 func (e *PartialMessagesExtension[PeerState]) EmitGossip(topic string, peers []peer.ID) {
