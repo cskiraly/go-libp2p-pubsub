@@ -1432,8 +1432,83 @@ func (gs *GossipSubRouter) PublishBatch(messages []*Message, opts *BatchPublishO
 	}
 
 	for p, rpc := range strategy.All() {
+		// Re-check IDONTWANT here, not only at plan time above: a batch plans every
+		// (peer, message) pair before transmitting any of them, so an IDONTWANT arising from the
+		// batch's own first copies cannot prune the remainder.
+		//
+		// How much this buys depends entirely on the scheduler. RoundRobinMessageIDScheduler
+		// drains immediately, so the plan-to-drain window is local computation and nothing can
+		// arrive inside it -- measured as no change at all in publisher upload. A *pacing*
+		// scheduler, which is the natural choice when the publisher's uplink is the constraint
+		// and the reason batch publishing exists, spreads sends over time and opens a real
+		// window. RPCScheduler is a pluggable interface, so both cases are reachable.
+		//
+		// A second window is not closed here: sendRPC enqueues onto a per-peer queue that a
+		// different goroutine drains to the wire, and an IDONTWANT arriving during that period
+		// should also prune. Checking there would mean reading router-loop state from the write
+		// goroutine, which is a data race, so it needs a concurrency change rather than a move.
+		if rpc = gs.withoutUnwanted(rpc, p); rpc == nil {
+			continue
+		}
 		gs.sendRPC(p, rpc, false)
 	}
+}
+
+// withoutUnwanted returns rpc with any message p has sent an IDONTWANT for removed, or nil when
+// that leaves nothing to send.
+//
+// It never mutates the RPC. gs.rpcs yields a single shared *RPC per message to every recipient, so
+// filtering in place would edit other peers' sends; the common case -- one message, still wanted --
+// returns the original untouched and allocates nothing.
+func (gs *GossipSubRouter) withoutUnwanted(rpc *RPC, p peer.ID) *RPC {
+	unwanted := gs.unwanted[p]
+	if len(unwanted) == 0 || len(rpc.Publish) == 0 {
+		return rpc
+	}
+	drop := 0
+	for _, msg := range rpc.Publish {
+		if _, no := unwanted[computeChecksum(gs.p.idGen.RawID(msg))]; no {
+			drop++
+		}
+	}
+	if drop == 0 {
+		return rpc
+	}
+	if drop == len(rpc.Publish) && len(rpc.Control.GetIhave()) == 0 &&
+		len(rpc.Control.GetIwant()) == 0 && len(rpc.Control.GetGraft()) == 0 &&
+		len(rpc.Control.GetPrune()) == 0 && len(rpc.Control.GetIdontwant()) == 0 {
+		return nil
+	}
+	kept := make([]*pb.Message, 0, len(rpc.Publish)-drop)
+	for _, msg := range rpc.Publish {
+		if _, no := unwanted[computeChecksum(gs.p.idGen.RawID(msg))]; !no {
+			kept = append(kept, msg)
+		}
+	}
+	out := shallowRPCCopy(rpc)
+	out.Publish = kept
+	return out
+}
+
+// shallowRPCCopy returns a new RPC sharing rpc's field values, so a caller may replace one field
+// without mutating an RPC other recipients still hold. Nothing beneath the fields is copied.
+//
+// The fields are assigned one by one rather than by copying the embedded pb.RPC value, because
+// that copy takes protoimpl.MessageState with it: per-instance protobuf state carrying a mutex, a
+// size cache computed for the *original* field set, and any unknown fields. The runtime marks it
+// DoNotCopy and `go vet` reports it. Nothing has miscomputed a size yet -- proto.Size recomputes
+// rather than trusting the cache -- so this is a latent hazard being removed, not a live bug.
+//
+// TestShallowRPCCopyCarriesEveryField pins the field list by reflection: a field added to pb.RPC
+// upstream fails that test rather than being silently dropped from every filtered send.
+func shallowRPCCopy(rpc *RPC) *RPC {
+	out := &RPC{from: rpc.from}
+	out.Subscriptions = rpc.Subscriptions
+	out.Publish = rpc.Publish
+	out.Control = rpc.Control
+	out.Partial = rpc.Partial
+	out.TestExtension = rpc.TestExtension
+	return out
 }
 
 func (gs *GossipSubRouter) Publish(msg *Message) {

@@ -1,9 +1,11 @@
 package pubsub
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -223,3 +225,125 @@ type gateFunc func(topic, mid string) bool
 
 func (f gateFunc) Allow(_ peer.ID, topic, mid string) bool { return f(topic, mid) }
 func (gateFunc) Committed(peer.ID, []string)               {}
+
+// TestPublishBatchRechecksIDontWant pins the drain-time IDONTWANT check.
+//
+// A batch plans every (peer, message) pair before transmitting any of them, so an IDONTWANT arriving
+// because of the batch's own first copies could not prune the remainder -- the relief batch
+// publishing exists to provide when the publisher's uplink is the constraint. The tell in
+// measurement was a publisher emitting a perfectly constant number of copies at every rate and
+// network size; constancy is what says "structural", and nothing in the suite caught it.
+func TestPublishBatchRechecksIDontWant(t *testing.T) {
+	mkRPC := func(ids ...string) *RPC {
+		msgs := make([]*pb.Message, 0, len(ids))
+		for _, id := range ids {
+			msgs = append(msgs, &pb.Message{Data: []byte(id)})
+		}
+		return &RPC{RPC: pb.RPC{Publish: msgs}}
+	}
+	// The id function is the message data, so a test can name ids directly.
+	gen := &msgIDGenerator{}
+	gen.Default = func(msg *pb.Message) string { return string(msg.GetData()) }
+	gs := &GossipSubRouter{
+		p:        &PubSub{idGen: gen},
+		unwanted: make(map[peer.ID]map[checksum]int),
+	}
+	victim := peer.ID("p1")
+	gs.unwanted[victim] = map[checksum]int{computeChecksum("b"): 3}
+
+	t.Run("an unwanted single-message RPC is dropped entirely", func(t *testing.T) {
+		if got := gs.withoutUnwanted(mkRPC("b"), victim); got != nil {
+			t.Fatal("an RPC carrying only an unwanted message was still sent")
+		}
+	})
+
+	t.Run("a wanted message is passed through untouched", func(t *testing.T) {
+		in := mkRPC("a")
+		got := gs.withoutUnwanted(in, victim)
+		if got != in {
+			t.Fatal("a wanted RPC was copied; the common case must allocate nothing")
+		}
+	})
+
+	t.Run("a peer with no IDONTWANT state is untouched", func(t *testing.T) {
+		in := mkRPC("b")
+		if got := gs.withoutUnwanted(in, peer.ID("other")); got != in {
+			t.Fatal("an unrelated peer's RPC was filtered")
+		}
+	})
+
+	t.Run("a mixed RPC keeps the wanted messages and does not mutate the shared original", func(t *testing.T) {
+		// gs.rpcs yields ONE shared *RPC per message to every recipient, so in-place filtering
+		// would silently edit what other peers receive.
+		in := mkRPC("a", "b", "c")
+		got := gs.withoutUnwanted(in, victim)
+		if got == in {
+			t.Fatal("filtered in place; other peers' sends would be corrupted")
+		}
+		if len(got.Publish) != 2 ||
+			string(got.Publish[0].GetData()) != "a" || string(got.Publish[1].GetData()) != "c" {
+			t.Fatalf("kept %d messages, want [a c]", len(got.Publish))
+		}
+		if len(in.Publish) != 3 {
+			t.Fatalf("the shared original now carries %d messages, want 3", len(in.Publish))
+		}
+	})
+
+	t.Run("control-only content survives an all-unwanted publish list", func(t *testing.T) {
+		in := mkRPC("b")
+		topic := "t"
+		in.Control = &pb.ControlMessage{Ihave: []*pb.ControlIHave{{TopicID: &topic}}}
+		got := gs.withoutUnwanted(in, victim)
+		if got == nil {
+			t.Fatal("dropped an RPC that still carried control messages")
+		}
+		if len(got.Publish) != 0 {
+			t.Fatalf("kept %d publish messages, want none", len(got.Publish))
+		}
+	})
+}
+
+// TestShallowRPCCopyCarriesEveryField guards the field list in shallowRPCCopy.
+//
+// The copy names pb.RPC's fields one at a time because copying the struct value would take
+// protobuf's per-instance state with it. That leaves a maintenance hazard the compiler cannot see:
+// a field added upstream is simply absent from the copy, and every filtered send drops it in
+// silence. So the fields are enumerated by reflection here rather than restated -- adding one to
+// pb.RPC without adding it to shallowRPCCopy fails this test.
+func TestShallowRPCCopyCarriesEveryField(t *testing.T) {
+	var in RPC
+	in.from = peer.ID("origin")
+	v := reflect.ValueOf(&in.RPC).Elem()
+	rpcType := v.Type()
+	for i := range rpcType.NumField() {
+		f := rpcType.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		// Non-zero, so the assertion below can tell "carried" from "left at its zero value".
+		switch f.Type.Kind() {
+		case reflect.Slice:
+			v.Field(i).Set(reflect.MakeSlice(f.Type, 1, 1))
+		case reflect.Pointer:
+			v.Field(i).Set(reflect.New(f.Type.Elem()))
+		default:
+			t.Fatalf("pb.RPC field %s is a %s, which this test cannot populate; teach it that kind",
+				f.Name, f.Type.Kind())
+		}
+	}
+
+	out := shallowRPCCopy(&in)
+	ov := reflect.ValueOf(&out.RPC).Elem()
+	for i := range rpcType.NumField() {
+		f := rpcType.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		if ov.Field(i).IsZero() {
+			t.Errorf("shallowRPCCopy drops pb.RPC field %s; add it there", f.Name)
+		}
+	}
+	if out.from != in.from {
+		t.Errorf("from = %q, want %q -- the unexported sender is part of the RPC too", out.from, in.from)
+	}
+}
