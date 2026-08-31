@@ -601,6 +601,7 @@ type GossipSubRouter struct {
 	peerhave     map[peer.ID]int                  // number of IHAVEs received from peer in the last heartbeat
 	peerdontwant map[peer.ID]int                  // number of IDONTWANTs received from peer in the last heartbeat
 	unwanted     map[peer.ID]map[checksum]int     // TTL of the message ids peers don't want
+	phaseForward *phaseForwarding                 // optional push-pull phase transition on the eager-push path
 	iasked       map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
 	outbound     map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
 	backoff      map[string]map[peer.ID]time.Time // prune backoff
@@ -1357,6 +1358,8 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 		topic := msg.GetTopic()
 
 		tosend := make(map[peer.ID]struct{})
+		// announce collects mesh peers that phase forwarding elected to IHAVE instead of push.
+		var announce []peer.ID
 
 		// any peers in the topic?
 		tmap, ok := gs.p.topics[topic]
@@ -1403,6 +1406,37 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 				}
 				tosend[p] = struct{}{}
 			}
+
+			if gs.phaseForward != nil && gs.phaseForward.match(topic) {
+				cand := gmap
+				if gs.phaseForward.meshless {
+					// Meshless: every connected gossipsub-capable topic peer is a candidate,
+					// gated the way flood publish gates, and the mesh stops deciding who
+					// gets eager copies.
+					cand = make(map[peer.ID]struct{}, len(tmap))
+					for p := range tmap {
+						if !gs.feature(GossipSubFeatureMesh, gs.peers[p]) {
+							continue
+						}
+						if gs.score.Score(p) < gs.publishThreshold {
+							continue
+						}
+						if _, ok := gs.unwanted[p][csum]; ok {
+							continue
+						}
+						cand[p] = struct{}{}
+						tosend[p] = struct{}{}
+					}
+				}
+				fromSelf := from == gs.p.host.ID()
+				announce = gs.phaseForward.trim(gs, gs.p.idGen.ID(msg), csum, cand, tosend, fromSelf)
+				if fromSelf && gs.phaseForward.srcMode == PhaseSourceDelay {
+					// The source's announce is deferred, not dropped: by the time it fires,
+					// first-hop holders have announced too and absorb the pulls.
+					gs.phaseForward.scheduleDeferredIHave(gs, topic, gs.p.idGen.ID(msg), announce)
+					announce = nil
+				}
+			}
 		}
 
 		out := rpcWithMessages(msg.Message)
@@ -1417,6 +1451,26 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 
 			if !yield(pid, out) {
 				return
+			}
+		}
+
+		// Phase forwarding: the mesh peers not pushed get an immediate IHAVE, so they can
+		// pull with an ordinary IWANT instead of waiting for the heartbeat's gossip.
+		if len(announce) > 0 {
+			mid := gs.p.idGen.ID(msg)
+			for _, pid := range announce {
+				if pid == from || pid == peer.ID(msg.GetFrom()) {
+					continue
+				}
+				if gs.iSupportSendingPartial(topic) && gs.peerRequestsPartial(pid, topic) {
+					continue
+				}
+				ihave := rpcWithControl(nil,
+					[]*pb.ControlIHave{{TopicID: &topic, MessageIDs: []string{mid}}},
+					nil, nil, nil, nil)
+				if !yield(pid, ihave) {
+					return
+				}
 			}
 		}
 	}
