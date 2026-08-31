@@ -605,6 +605,13 @@ type GossipSubRouter struct {
 	phaseForward   *phaseForwarding                 // optional push-pull phase transition on the eager-push path
 	iwantWindow    time.Duration                    // optional one-outstanding-IWANT-per-id window
 	iwantAsked     map[string]time.Time             // message ids with an IWANT in flight, by request time
+	iwantHedge     time.Duration                    // optional: permit a 2nd IWANT after this elapsed
+	iwantCount     map[string]int                   // outstanding IWANTs per id, for the hedge cap
+	adaptHedge     *adaptiveHedge                   // optional: two-controller adaptive hedge (delay + AIMD rate)
+	nqg            *nqgConfig                       // optional: (N,q,g) request kernel
+	nqgAsked       map[string]map[peer.ID]time.Time // per-mid asked peers and times, for (N,q,g)
+	rttPeer        map[peer.ID]*peerQuantile        // per-peer response-time quantile (warms across payloads)
+	rttGlobal      *peerQuantile                    // global prior for cold peers
 	iwantBudgetMax int                              // optional PR-625-style per-heartbeat IWANT budget per id
 	iwantBudget    map[string]int                   // remaining budget by message id
 	rng            *rand.Rand                       // optional seeded shuffle source (deterministic mode)
@@ -995,6 +1002,14 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 				continue
 			}
 			gs.noteAnnouncedHolder(mid, p)
+			if gs.nqg != nil {
+				// (N,q,g) kernel owns the request decision when enabled.
+				if !gs.nqgAllowed(mid, p) {
+					continue
+				}
+				iwant[mid] = struct{}{}
+				continue
+			}
 			if !gs.iwantAllowed(mid) {
 				continue
 			}
@@ -1385,6 +1400,11 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 		from := msg.ReceivedFrom
 		topic := msg.GetTopic()
 
+		// (N,q,g): a message from a peer we asked is a claim->arrival sample for that peer.
+		if gs.nqg != nil {
+			gs.nqgObserve(gs.p.idGen.ID(msg), from)
+		}
+
 		tosend := make(map[peer.ID]struct{})
 		// announce collects mesh peers that phase forwarding elected to IHAVE instead of push.
 		var announce []peer.ID
@@ -1765,6 +1785,8 @@ func (gs *GossipSubRouter) heartbeat() {
 	// expire outstanding-IWANT records and announce-fed holder entries
 	gs.clearIWantAsked()
 	gs.resetIWantBudget()
+	gs.updateAdaptiveHedge()
+	gs.clearNqgAsked()
 	gs.clearPhaseHolders()
 
 	// apply IWANT request penalties

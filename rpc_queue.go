@@ -145,3 +145,11 @@ func (q *rpcQueue) Close() {
 	q.dataAvailable.Broadcast()
 	q.spaceAvailable.Broadcast()
 }
+
+// Occupancy returns the current queue length and its capacity, for the adaptive hedge's
+// local congestion signal (measurement-plan section 15, Job 2).
+func (q *rpcQueue) Occupancy() (length, capacity int) {
+	q.queueMu.Lock()
+	defer q.queueMu.Unlock()
+	return q.queue.Len(), q.maxSize
+}

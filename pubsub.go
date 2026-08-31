@@ -175,6 +175,12 @@ type PubSub struct {
 
 	peers map[peer.ID]*rpcQueue
 
+	// sendDelay, when set (test-only F2b injection, measurement-plan section 15), stalls this
+	// node's outbound writer per RPC, so its rpcQueue backs up and overflows through the
+	// normal doDropRPC path -- real queue pressure from a slow drain, not a probabilistic
+	// strip (that is F2a). Models a node whose send path cannot keep up.
+	sendDelay time.Duration
+
 	inboundStreamsMx sync.Mutex
 	inboundStreams   map[peer.ID]inboundHandler
 

@@ -525,6 +525,28 @@ func WithIWantDiscipline(window time.Duration) Option {
 	}
 }
 
+// WithIWantHedge lets a second IWANT for the same id go out once `after` has elapsed since
+// the first, capping at two outstanding. It is the cheap mitigation for pull-only's
+// completion risk under withholding (measurement-plan section 15): a stalled first request
+// no longer waits a full window for a fresh announcement to re-open the id. Requires the
+// discipline; a later announcer's IHAVE, from a different peer, is what carries the hedge,
+// so it naturally lands on a second holder rather than re-asking the silent one. `after`
+// should be a round trip or two, well below the window.
+func WithIWantHedge(after time.Duration) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("iwant hedge requires a gossipsub router")
+		}
+		if after <= 0 {
+			return fmt.Errorf("iwant hedge delay must be positive")
+		}
+		gs.iwantHedge = after
+		gs.iwantCount = make(map[string]int)
+		return nil
+	}
+}
+
 // --- Deterministic randomness (common-random-numbers mode for the harness) ---
 //
 // Gossipsub's mesh draw runs the global math/rand over map-iteration-ordered candidate
@@ -595,6 +617,306 @@ func (gs *GossipSubRouter) shufflePeerInfo(peers []*pb.PeerInfo) {
 	}
 }
 
+// WithSendDelay stalls this node's outbound writer per RPC (F2b real queue pressure,
+// measurement-plan section 15). Applied to selected nodes by the harness; their rpcQueue
+// then overflows naturally through doDropRPC as offered load outpaces the slowed drain.
+// Test-only; a production node must never set it.
+func WithSendDelay(d time.Duration) Option {
+	return func(ps *PubSub) error {
+		if d <= 0 {
+			return fmt.Errorf("send delay must be positive")
+		}
+		ps.sendDelay = d
+		return nil
+	}
+}
+
+// --- (N, q, g) request kernel (design-space §10; measurement-plan §15) ---
+//
+// The inner per-message-ID launch scheduler: keep N *plausible* outstanding requests, each
+// declared implausible (and replaceable) at a per-peer quantile F_p⁻¹(q) of that peer's
+// response time, clamped to [floor, ceil] with ceil doubling as the hard deadline so a
+// withholder times out. Estimation is online and warms across payloads (repeated harness),
+// which is the whole reason this cannot be judged single-shot (Q30).
+//
+// Honest scope, per the external review: this is the *kernel*, not the deployable path. It
+// is IHAVE-driven (a replacement is dispatched when the next candidate's IHAVE arrives, not
+// from a timer callback — the "otherwise dispatch on IHAVE arrival" fallback used as the
+// only trigger); the where-ranking is "a fresh, still-plausible candidate" (LCFS-ish by
+// arrival, no reliability/load ranking); node/group admission limits and serve-probability
+// are not modelled; sampling is win-biased and post-verification, as in variant B.
+
+// peerQuantile is a Robbins-Monro online estimate of the q-quantile of a peer's response
+// time. One float and a count per peer; the step is a fraction of the current estimate.
+type peerQuantile struct {
+	est time.Duration
+	n   int
+}
+
+func (pq *peerQuantile) observe(sample time.Duration, q float64) {
+	if pq.n == 0 {
+		pq.est, pq.n = sample, 1
+		return
+	}
+	step := time.Duration(float64(pq.est) * 0.10)
+	if step <= 0 {
+		step = time.Millisecond
+	}
+	if sample <= pq.est {
+		pq.est -= time.Duration(float64(step) * (1 - q))
+	} else {
+		pq.est += time.Duration(float64(step) * q)
+	}
+	if pq.est < 0 {
+		pq.est = 0
+	}
+	pq.n++
+}
+
+type nqgConfig struct {
+	n           int
+	q           float64
+	floor, ceil time.Duration
+	minSamples  int
+}
+
+// WithRequestNQG enables the (N, q, g) kernel. Distinct from the discipline/hedge modes;
+// enable one. dInit seeds the global prior used for cold peers.
+func WithRequestNQG(n int, q float64, floor, ceil, dInit time.Duration) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("request-nqg requires a gossipsub router")
+		}
+		if n < 1 || q <= 0 || q >= 1 || floor <= 0 || ceil < floor || dInit < floor || dInit > ceil {
+			return fmt.Errorf("bad request-nqg parameters")
+		}
+		gs.nqg = &nqgConfig{n: n, q: q, floor: floor, ceil: ceil, minSamples: 8}
+		gs.nqgAsked = make(map[string]map[peer.ID]time.Time)
+		gs.rttPeer = make(map[peer.ID]*peerQuantile)
+		gs.rttGlobal = &peerQuantile{est: dInit, n: 1}
+		return nil
+	}
+}
+
+// nqgTimer is peer p's implausibility timeout: its own quantile once warm, else the global
+// prior, clamped to [floor, ceil]. ceil is the hard deadline that fires against silence.
+func (gs *GossipSubRouter) nqgTimer(p peer.ID) time.Duration {
+	est := gs.rttGlobal.est
+	if pq, ok := gs.rttPeer[p]; ok && pq.n >= gs.nqg.minSamples {
+		est = pq.est
+	}
+	if est < gs.nqg.floor {
+		est = gs.nqg.floor
+	}
+	if est > gs.nqg.ceil {
+		est = gs.nqg.ceil
+	}
+	return est
+}
+
+// nqgAllowed decides whether to dispatch a request for mid to announcer p: maintain N
+// plausible (unexpired) asks, never re-ask a still-plausible peer, drop expired asks (they
+// race on, no cancel). Runs on pubsub's goroutine.
+func (gs *GossipSubRouter) nqgAllowed(mid string, p peer.ID) bool {
+	asks := gs.nqgAsked[mid]
+	if asks == nil {
+		asks = make(map[peer.ID]time.Time)
+		gs.nqgAsked[mid] = asks
+	}
+	now := time.Now()
+	plausible := 0
+	for q, at := range asks {
+		if now.Sub(at) >= gs.nqgTimer(q) {
+			delete(asks, q) // implausible: no longer counts toward N; still on the wire
+			continue
+		}
+		plausible++
+	}
+	if plausible >= gs.nqg.n {
+		return false
+	}
+	if _, ok := asks[p]; ok {
+		return false // already have a plausible request to this peer
+	}
+	asks[p] = now
+	return true
+}
+
+// nqgObserve feeds a claim->arrival sample for a served id, if we asked that peer for it.
+func (gs *GossipSubRouter) nqgObserve(mid string, from peer.ID) {
+	if gs.nqg == nil {
+		return
+	}
+	asks := gs.nqgAsked[mid]
+	if asks == nil {
+		return
+	}
+	if at, ok := asks[from]; ok {
+		sample := time.Since(at)
+		if sample > 0 {
+			pq := gs.rttPeer[from]
+			if pq == nil {
+				pq = &peerQuantile{}
+				gs.rttPeer[from] = pq
+			}
+			pq.observe(sample, gs.nqg.q)
+			gs.rttGlobal.observe(sample, gs.nqg.q)
+		}
+	}
+	delete(gs.nqgAsked, mid) // satisfied
+}
+
+// clearNqgAsked drops fully-expired id entries at the heartbeat (rttPeer persists — it warms
+// across payloads).
+func (gs *GossipSubRouter) clearNqgAsked() {
+	if gs.nqgAsked == nil {
+		return
+	}
+	now := time.Now()
+	for mid, asks := range gs.nqgAsked {
+		allOld := true
+		for _, at := range asks {
+			if now.Sub(at) < gs.nqg.ceil {
+				allOld = false
+				break
+			}
+		}
+		if allOld {
+			delete(gs.nqgAsked, mid)
+		}
+	}
+}
+
+// --- Adaptive hedge: two decoupled controllers (measurement-plan section 15) ---
+//
+// Job 1 sets the hedge delay d by tracking a tail quantile of arrival latency (when to
+// hedge); job 2 gates hedging with an AIMD rate e driven by local queue occupancy (how much
+// under load). They are separate because d must RISE under heterogeneous latency while e
+// must FALL under congestion -- one knob cannot do both. Both update at the heartbeat.
+type adaptiveHedge struct {
+	// Job 1: quantile-tracked delay.
+	d      time.Duration // current hedge delay
+	dMin   time.Duration
+	dMax   time.Duration
+	target float64       // desired hedge-launch rate (e.g. 0.05 => d tracks p95)
+	eta    time.Duration // Robbins-Monro step
+	// Job 2: AIMD hedge-firing probability.
+	e     float64 // in (0,1]
+	aiAdd float64 // additive increase per heartbeat
+	aiMul float64 // multiplicative decrease factor (<1)
+	qHigh float64 // queue-occupancy fraction that triggers the decrease
+	// Per-epoch counters, reset each heartbeat.
+	launched int // hedges fired this epoch (job-1 numerator)
+	eligible int // ids that reached d this epoch (job-1 denominator)
+	// Observability: did Job 2 ever engage, and how deep did the queue get? Scaled x1000
+	// into the optional atomics so the harness can log them (min e, max occupancy seen).
+	minE   *atomic.Int64
+	maxOcc *atomic.Int64
+}
+
+// WithAdaptiveHedge turns the fixed hedge delay into the two-controller form. Requires the
+// discipline. Sensible defaults; the harness overrides target/bounds by env.
+func WithAdaptiveHedge(dInit, dMin, dMax time.Duration, target, qHigh float64, minE, maxOcc *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("adaptive hedge requires a gossipsub router")
+		}
+		if target <= 0 || target >= 1 || dMin <= 0 || dMax < dMin || dInit < dMin || dInit > dMax || qHigh <= 0 || qHigh >= 1 {
+			return fmt.Errorf("bad adaptive hedge parameters")
+		}
+		gs.adaptHedge = &adaptiveHedge{
+			d: dInit, dMin: dMin, dMax: dMax, target: target, eta: dMin / 4,
+			e: 1.0, aiAdd: 0.1, aiMul: 0.5, qHigh: qHigh,
+			minE: minE, maxOcc: maxOcc,
+		}
+		if minE != nil {
+			minE.Store(1000) // e starts at 1.0
+		}
+		gs.iwantCount = make(map[string]int)
+		return nil
+	}
+}
+
+// hedgeAllowedAdaptive is the adaptive counterpart of the fixed-delay hedge check. Called
+// from iwantAllowed when a request for mid is already outstanding.
+func (gs *GossipSubRouter) hedgeAllowedAdaptive(mid string, elapsed time.Duration) bool {
+	a := gs.adaptHedge
+	if elapsed < a.d {
+		return false // job 1: not yet at the delay
+	}
+	if gs.iwantCount[mid] >= 2 {
+		return false // cap at two outstanding
+	}
+	a.eligible++
+	// job 2: fire only with probability e (the AIMD budget). Use the seeded rng if present
+	// so the decision is reproducible under SEGMENT_DET_RAND, else the global source.
+	var r float64
+	if gs.rng != nil {
+		r = gs.rng.Float64()
+	} else {
+		r = rand.Float64()
+	}
+	if r >= a.e {
+		return false
+	}
+	a.launched++
+	gs.iwantCount[mid]++
+	return true
+}
+
+// updateAdaptiveHedge runs both control loops once, at the heartbeat.
+func (gs *GossipSubRouter) updateAdaptiveHedge() {
+	a := gs.adaptHedge
+	if a == nil {
+		return
+	}
+	// Job 1: Robbins-Monro on the hedge-launch rate. H is the observed rate this epoch; nudge
+	// d toward the delay at which H == target. Too many launches => d too small => raise it.
+	if a.eligible > 0 {
+		h := float64(a.launched) / float64(a.eligible)
+		d := a.d + time.Duration((h-a.target)*float64(a.eta)*4)
+		if d < a.dMin {
+			d = a.dMin
+		}
+		if d > a.dMax {
+			d = a.dMax
+		}
+		a.d = d
+	}
+	a.launched, a.eligible = 0, 0
+	// Job 2: AIMD on e, signal = max outbound-queue occupancy across this node's peers.
+	occ := 0.0
+	for _, q := range gs.p.peers {
+		l, c := q.Occupancy()
+		if c > 0 {
+			if f := float64(l) / float64(c); f > occ {
+				occ = f
+			}
+		}
+	}
+	if occ >= a.qHigh {
+		a.e *= a.aiMul // multiplicative decrease: back off fast
+	} else {
+		a.e += a.aiAdd // additive increase: creep back
+		if a.e > 1.0 {
+			a.e = 1.0
+		}
+	}
+	// Observability: record how far e fell and how deep the queue ever got.
+	if a.minE != nil {
+		if v := int64(a.e * 1000); v < a.minE.Load() {
+			a.minE.Store(v)
+		}
+	}
+	if a.maxOcc != nil {
+		if v := int64(occ * 1000); v > a.maxOcc.Load() {
+			a.maxOcc.Store(v)
+		}
+	}
+}
+
 // WithIWantBudget enables the upstream-PR-625 rule instead: a per-message-id IWANT budget
 // that the heartbeat resets wholesale and message arrival clears. Same intent as the
 // discipline, different retry clock -- the budget re-opens at the next heartbeat *boundary*,
@@ -652,9 +974,24 @@ func (gs *GossipSubRouter) iwantAllowed(mid string) bool {
 		return true
 	}
 	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
+		elapsed := time.Since(at)
+		// Adaptive hedge (two-controller form) takes precedence over the fixed one.
+		if gs.adaptHedge != nil {
+			return gs.hedgeAllowedAdaptive(mid, elapsed)
+		}
+		// Fixed hedge: once the first ask has been outstanding for iwantHedge, permit exactly
+		// one more (total two) without extending the window. The elapsed check keeps a burst
+		// of near-simultaneous announcers from firing two requests at once.
+		if gs.iwantHedge > 0 && elapsed >= gs.iwantHedge && gs.iwantCount[mid] < 2 {
+			gs.iwantCount[mid]++
+			return true
+		}
 		return false
 	}
 	gs.iwantAsked[mid] = time.Now()
+	if gs.iwantCount != nil {
+		gs.iwantCount[mid] = 1
+	}
 	return true
 }
 
@@ -666,6 +1003,9 @@ func (gs *GossipSubRouter) clearIWantAsked() {
 	for mid, at := range gs.iwantAsked {
 		if time.Since(at) >= gs.iwantWindow {
 			delete(gs.iwantAsked, mid)
+			if gs.iwantCount != nil {
+				delete(gs.iwantCount, mid)
+			}
 		}
 	}
 }

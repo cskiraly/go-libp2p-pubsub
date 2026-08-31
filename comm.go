@@ -218,6 +218,13 @@ func (p *PubSub) handlePeerDead(s network.Stream) {
 
 func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, outgoing *rpcQueue, firstMessage chan *RPC) {
 	writeRpc := func(rpc *RPC) error {
+		if p.sendDelay > 0 {
+			select {
+			case <-time.After(p.sendDelay):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		size := uint64(proto.Size(&rpc.RPC))
 
 		buf := pool.Get(varint.UvarintSize(size) + int(size))
