@@ -3,6 +3,7 @@ package pubsub
 import (
 	"fmt"
 	"hash/fnv"
+	"math/rand"
 	"sort"
 	"time"
 
@@ -285,6 +286,76 @@ func WithIWantDiscipline(window time.Duration) Option {
 		gs.iwantWindow = window
 		gs.iwantAsked = make(map[string]time.Time)
 		return nil
+	}
+}
+
+// --- Deterministic randomness (common-random-numbers mode for the harness) ---
+//
+// Gossipsub's mesh draw runs the global math/rand over map-iteration-ordered candidate
+// lists, so two runs on the same connectivity graph grow different meshes (Q23: pull-only
+// completion spans 0.79-1.37 s across realizations at constant bytes). This mode makes the
+// draw a function of the seed: candidate lists are sorted by a run-stable key before a
+// Fisher-Yates from a router-local seeded source. Peer IDs are fresh keys every run, so the
+// sort key is the peer's first known address -- stable in simnet, where addresses derive
+// from the node index. Harness-only; upstream needs none of this.
+
+// WithDeterministicRand replaces the router's shuffle randomness with a seeded source.
+func WithDeterministicRand(seed int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("deterministic rand requires a gossipsub router")
+		}
+		gs.rng = rand.New(rand.NewSource(seed))
+		return nil
+	}
+}
+
+// stablePeerKey orders peers by first known address, falling back to the id.
+func (gs *GossipSubRouter) stablePeerKey(p peer.ID) string {
+	if addrs := gs.p.host.Peerstore().Addrs(p); len(addrs) > 0 {
+		return addrs[0].String()
+	}
+	return string(p)
+}
+
+func (gs *GossipSubRouter) shufflePeers(peers []peer.ID) {
+	if gs.rng == nil {
+		shufflePeers(peers)
+		return
+	}
+	sort.Slice(peers, func(i, j int) bool {
+		return gs.stablePeerKey(peers[i]) < gs.stablePeerKey(peers[j])
+	})
+	for i := range peers {
+		j := gs.rng.Intn(i + 1)
+		peers[i], peers[j] = peers[j], peers[i]
+	}
+}
+
+func (gs *GossipSubRouter) shuffleStrings(lst []string) {
+	if gs.rng == nil {
+		shuffleStrings(lst)
+		return
+	}
+	sort.Strings(lst)
+	for i := range lst {
+		j := gs.rng.Intn(i + 1)
+		lst[i], lst[j] = lst[j], lst[i]
+	}
+}
+
+func (gs *GossipSubRouter) shufflePeerInfo(peers []*pb.PeerInfo) {
+	if gs.rng == nil {
+		shufflePeerInfo(peers)
+		return
+	}
+	sort.Slice(peers, func(i, j int) bool {
+		return string(peers[i].GetPeerID()) < string(peers[j].GetPeerID())
+	})
+	for i := range peers {
+		j := gs.rng.Intn(i + 1)
+		peers[i], peers[j] = peers[j], peers[i]
 	}
 }
 

@@ -606,6 +606,7 @@ type GossipSubRouter struct {
 	iwantAsked     map[string]time.Time             // message ids with an IWANT in flight, by request time
 	iwantBudgetMax int                              // optional PR-625-style per-heartbeat IWANT budget per id
 	iwantBudget    map[string]int                   // remaining budget by message id
+	rng            *rand.Rand                       // optional seeded shuffle source (deterministic mode)
 	phaseHolders   map[string]*phaseHolderEntry     // optional announce-fed holder tracking for phase forwarding
 	iasked         map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
 	outbound       map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
@@ -895,7 +896,7 @@ func (gs *GossipSubRouter) Preprocess(from peer.ID, msgs []*Message) {
 			continue
 		}
 		// shuffle the messages got from the RPC envelope
-		shuffleStrings(mids)
+		gs.shuffleStrings(mids)
 		// send IDONTWANT to all the mesh peers
 		for p := range gs.mesh[topic] {
 			if p == from {
@@ -1013,7 +1014,7 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 	}
 
 	// ask in random order
-	shuffleStrings(iwantlst)
+	gs.shuffleStrings(iwantlst)
 
 	// truncate to the messages we are actually asking for and update the iasked counter
 	iwantlst = iwantlst[:iask]
@@ -1264,7 +1265,7 @@ func (gs *GossipSubRouter) doAddBackoff(p peer.ID, topic string, interval time.D
 
 func (gs *GossipSubRouter) pxConnect(peers []*pb.PeerInfo) {
 	if len(peers) > gs.params.PrunePeers {
-		shufflePeerInfo(peers)
+		gs.shufflePeerInfo(peers)
 		peers = peers[:gs.params.PrunePeers]
 	}
 
@@ -1816,14 +1817,14 @@ func (gs *GossipSubRouter) heartbeat() {
 			plst := peerMapToList(peers)
 
 			// sort by score (but shuffle first for the case we don't use the score)
-			shufflePeers(plst)
+			gs.shufflePeers(plst)
 			sort.Slice(plst, func(i, j int) bool {
 				return score(plst[i]) > score(plst[j])
 			})
 
 			// We keep the first D_score peers by score and the remaining up to D randomly
 			// under the constraint that we keep D_out peers in the mesh (if we have that many)
-			shufflePeers(plst[gs.params.Dscore:])
+			gs.shufflePeers(plst[gs.params.Dscore:])
 
 			// count the outbound peers we are keeping
 			outbound := 0
@@ -2141,7 +2142,7 @@ func (gs *GossipSubRouter) emitGossip(topic string, exclude map[peer.ID]struct{}
 	if target > len(peers) {
 		target = len(peers)
 	} else {
-		shufflePeers(peers)
+		gs.shufflePeers(peers)
 	}
 	peers = peers[:target]
 
@@ -2160,7 +2161,7 @@ func (gs *GossipSubRouter) emitGossip(topic string, exclude map[peer.ID]struct{}
 	// Emit the IHAVE gossip to the selected peers.
 	if len(peers) > 0 && len(mids) > 0 {
 		// shuffle to emit in random order
-		shuffleStrings(mids)
+		gs.shuffleStrings(mids)
 
 		// truncation is done after shuffling per peer below
 		if len(mids) > gs.params.MaxIHaveLength {
@@ -2174,7 +2175,7 @@ func (gs *GossipSubRouter) emitGossip(topic string, exclude map[peer.ID]struct{}
 				// we have enough redundancy in the system that this will significantly increase the message
 				// coverage when we do truncate.
 				peerMids = make([]string, gs.params.MaxIHaveLength)
-				shuffleStrings(mids)
+				gs.shuffleStrings(mids)
 				copy(peerMids, mids)
 			}
 			gs.enqueueGossip(p, &pb.ControlIHave{TopicID: &topic, MessageIDs: peerMids})
@@ -2339,7 +2340,7 @@ func (gs *GossipSubRouter) getPeers(topic string, count int, filter func(peer.ID
 		}
 	}
 
-	shufflePeers(peers)
+	gs.shufflePeers(peers)
 
 	if count > 0 && len(peers) > count {
 		peers = peers[:count]
