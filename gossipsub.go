@@ -605,6 +605,7 @@ type GossipSubRouter struct {
 	iwantWindow  time.Duration                    // optional one-outstanding-IWANT-per-id window
 	iwantMatch   func(topic string) bool          // topics the discipline applies to; nil = all
 	iwantAsked   map[string]time.Time             // message ids with an IWANT in flight, by request time
+	park         *commitmentPark                  // optional: IHAVE is a binding offer; unserved asks park the announcer
 	iasked       map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
 	outbound     map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
 	backoff      map[string]map[peer.ID]time.Time // prune backoff
@@ -880,11 +881,13 @@ func (gs *GossipSubRouter) AcceptFrom(p peer.ID) AcceptStatus {
 func (gs *GossipSubRouter) Preprocess(from peer.ID, msgs []*Message) {
 	tmids := make(map[string][]string)
 	for _, msg := range msgs {
+		mid := gs.p.idGen.ID(msg)
+		gs.noteDelivered(mid)
 		if len(msg.GetData()) < gs.params.IDontWantMessageThreshold {
 			continue
 		}
 		topic := msg.GetTopic()
-		tmids[topic] = append(tmids[topic], gs.p.idGen.ID(msg))
+		tmids[topic] = append(tmids[topic], mid)
 	}
 	for topic, mids := range tmids {
 		if len(mids) == 0 {
@@ -969,6 +972,12 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 		}
 
 		if !gs.p.peerFilter(p, topic) {
+			continue
+		}
+
+		// Commitment enforcement: a parked peer's announcements on a disciplined topic are
+		// ineligible for pull selection until its park expires.
+		if gs.disciplined(topic) && gs.peerParked(p) {
 			continue
 		}
 
