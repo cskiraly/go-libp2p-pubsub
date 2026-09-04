@@ -51,15 +51,17 @@ func (gs *GossipSubRouter) iwantAllowed(mid, topic string, from peer.ID) bool {
 	}
 	gs.iwantAsked[mid] = time.Now()
 	gs.notePromise(mid, from, gs.iwantAsked[mid])
+	gs.noteOfferTried(mid, from)
 	return true
 }
 
 // noteDelivered runs on every received message: delivery keeps every open promise for the
-// id, from whichever peer served it.
+// id, from whichever peer served it, and the id's offers are no longer needed.
 func (gs *GossipSubRouter) noteDelivered(mid string) {
 	if gs.park != nil {
 		delete(gs.park.promised, mid)
 	}
+	gs.clearOffers(mid)
 }
 
 // clearIWantAsked drops expired outstanding-request records; called from the heartbeat.

@@ -606,6 +606,7 @@ type GossipSubRouter struct {
 	iwantMatch   func(topic string) bool          // topics the discipline applies to; nil = all
 	iwantAsked   map[string]time.Time             // message ids with an IWANT in flight, by request time
 	park         *commitmentPark                  // optional: IHAVE is a binding offer; unserved asks park the announcer
+	offers       *offerTable                      // optional: remembered announcers, re-asked when the discipline moves on
 	iasked       map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
 	outbound     map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
 	backoff      map[string]map[peer.ID]time.Time // prune backoff
@@ -992,6 +993,7 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 			if gs.p.seenMessage(mid) {
 				continue
 			}
+			gs.recordOffer(mid, topic, p)
 			if _, dup := iwant[mid]; dup {
 				continue
 			}
@@ -1740,8 +1742,9 @@ func (gs *GossipSubRouter) heartbeat() {
 	// clean up IDONTWANT counters
 	gs.clearIDontWantCounters()
 
-	// expire outstanding-IWANT records
+	// expire outstanding-IWANT records and stale offers
 	gs.clearIWantAsked()
+	gs.sweepOffers()
 
 	// apply IWANT request penalties
 	gs.applyIwantPenalties()
