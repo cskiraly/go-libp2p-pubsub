@@ -602,6 +602,9 @@ type GossipSubRouter struct {
 	peerdontwant map[peer.ID]int                  // number of IDONTWANTs received from peer in the last heartbeat
 	unwanted     map[peer.ID]map[checksum]int     // TTL of the message ids peers don't want
 	phaseForward *phaseForwarding                 // optional push-pull phase transition on the eager-push path
+	iwantWindow  time.Duration                    // optional one-outstanding-IWANT-per-id window
+	iwantMatch   func(topic string) bool          // topics the discipline applies to; nil = all
+	iwantAsked   map[string]time.Time             // message ids with an IWANT in flight, by request time
 	iasked       map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
 	outbound     map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
 	backoff      map[string]map[peer.ID]time.Time // prune backoff
@@ -955,7 +958,9 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 		return nil
 	}
 
-	iwant := make(map[string]struct{})
+	// iwant is the dedup set; an id announced under several topics keeps the first.
+	iwant := make(map[string]string)
+	candidates := make([]string, 0, 32)
 	for _, ihave := range ctl.GetIhave() {
 		topic := ihave.GetTopicID()
 		_, ok := gs.mesh[topic]
@@ -978,36 +983,63 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 			if gs.p.seenMessage(mid) {
 				continue
 			}
-			iwant[mid] = struct{}{}
+			if _, dup := iwant[mid]; dup {
+				continue
+			}
+			iwant[mid] = topic
+			candidates = append(candidates, mid)
 		}
 	}
 
-	if len(iwant) == 0 {
+	if len(candidates) == 0 {
 		return nil
 	}
 
-	iask := len(iwant)
-	if iask+gs.iasked[p] > gs.params.MaxIHaveLength {
-		iask = gs.params.MaxIHaveLength - gs.iasked[p]
+	// Decide the per-peer allowance before consulting any request policy. The policies record
+	// state as a side effect of allowing an id, so selecting more ids than we will send and
+	// truncating afterwards would leave phantom entries: an id marked as requested that no
+	// IWANT ever carried, suppressed until its window expires. Shuffling the candidates here
+	// rather than the selected list keeps the anti-gaming property -- a peer cannot steer which
+	// ids we ask for by ordering its IHAVE -- while making selection and dispatch the same set.
+	allowance := gs.params.MaxIHaveLength - gs.iasked[p]
+	if allowance <= 0 {
+		return nil
+	}
+	shuffleStrings(candidates)
+
+	iwantlst := gs.selectIWants(candidates, iwant, p, allowance)
+	if len(iwantlst) == 0 {
+		return nil
 	}
 
-	gs.logger.Debug("IHAVE: Asking for messages from peer", "asking", iask, "total", len(iwant), "peer", p)
-
-	iwantlst := make([]string, 0, len(iwant))
-	for mid := range iwant {
-		iwantlst = append(iwantlst, mid)
-	}
-
-	// ask in random order
-	shuffleStrings(iwantlst)
-
-	// truncate to the messages we are actually asking for and update the iasked counter
-	iwantlst = iwantlst[:iask]
-	gs.iasked[p] += iask
+	gs.logger.Debug("IHAVE: Asking for messages from peer", "asking", len(iwantlst), "candidates", len(candidates), "peer", p)
+	gs.iasked[p] += len(iwantlst)
 
 	gs.gossipTracer.AddPromise(p, iwantlst)
 
 	return []*pb.ControlIWant{{MessageIDs: iwantlst}}
+}
+
+// selectIWants picks at most allowance ids from candidates, consulting the active request
+// policies in order. Selection and dispatch are the same set by construction: each policy
+// records state as a side effect of allowing an id, so callers must shuffle candidates before
+// calling this rather than truncate the result after. topicOf maps each candidate to the topic
+// it was announced under, which decides whether the discipline applies to it.
+func (gs *GossipSubRouter) selectIWants(candidates []string, topicOf map[string]string, p peer.ID, allowance int) []string {
+	if allowance <= 0 {
+		return nil
+	}
+	out := make([]string, 0, min(len(candidates), allowance))
+	for _, mid := range candidates {
+		if len(out) >= allowance {
+			break
+		}
+		if !gs.iwantAllowed(mid, topicOf[mid], p) {
+			continue
+		}
+		out = append(out, mid)
+	}
+	return out
 }
 
 func (gs *GossipSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb.Message {
@@ -1698,6 +1730,9 @@ func (gs *GossipSubRouter) heartbeat() {
 
 	// clean up IDONTWANT counters
 	gs.clearIDontWantCounters()
+
+	// expire outstanding-IWANT records
+	gs.clearIWantAsked()
 
 	// apply IWANT request penalties
 	gs.applyIwantPenalties()
