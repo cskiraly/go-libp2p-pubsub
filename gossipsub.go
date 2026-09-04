@@ -607,6 +607,9 @@ type GossipSubRouter struct {
 	iwantAsked   map[string]time.Time             // message ids with an IWANT in flight, by request time
 	park         *commitmentPark                  // optional: IHAVE is a binding offer; unserved asks park the announcer
 	offers       *offerTable                      // optional: remembered announcers, re-asked when the discipline moves on
+	requestGate  RequestGate                      // optional application veto on requesting an announced id
+	deferred     map[string]*deferredEntry        // declined announcements, replayable when the gate opens
+	deferredMax  int                              // cap on deferred entries
 	iasked       map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
 	outbound     map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
 	backoff      map[string]map[peer.ID]time.Time // prune backoff
@@ -1027,6 +1030,9 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 	gs.iasked[p] += len(iwantlst)
 
 	gs.gossipTracer.AddPromise(p, iwantlst)
+	// Only the dispatched set is reported, so an application budget is charged for requests
+	// that were actually made rather than for ids a later policy refused.
+	gs.gateCommitted(p, iwantlst)
 
 	return []*pb.ControlIWant{{MessageIDs: iwantlst}}
 }
@@ -1035,7 +1041,14 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 // policies in order. Selection and dispatch are the same set by construction: each policy
 // records state as a side effect of allowing an id, so callers must shuffle candidates before
 // calling this rather than truncate the result after. topicOf maps each candidate to the topic
-// it was announced under, which decides whether the discipline applies to it.
+// it was announced under, which decides whether the discipline applies to it and is what the
+// gate sees.
+//
+// The application request gate runs first, ahead of every policy, and that ordering is
+// load-bearing: the policies mutate their ledgers when they allow an id, so a gate placed after
+// any of them would burn the id on every decline, and an application that declines now and
+// wants the same id later could never come back for it. Ahead of them, a decline touches
+// nothing and is retryable.
 func (gs *GossipSubRouter) selectIWants(candidates []string, topicOf map[string]string, p peer.ID, allowance int) []string {
 	if allowance <= 0 {
 		return nil
@@ -1044,6 +1057,10 @@ func (gs *GossipSubRouter) selectIWants(candidates []string, topicOf map[string]
 	for _, mid := range candidates {
 		if len(out) >= allowance {
 			break
+		}
+		if !gs.gateAllows(p, topicOf[mid], mid) {
+			gs.noteDeclined(p, topicOf[mid], mid)
+			continue
 		}
 		if !gs.iwantAllowed(mid, topicOf[mid], p) {
 			continue

@@ -137,7 +137,7 @@ func (gs *GossipSubRouter) sweepOffers() {
 }
 
 // pickOfferedPeer chooses the announcer to re-ask for mid: untried first, then least recently
-// tried, in deterministic peer order. Parked announcers are skipped.
+// tried, in deterministic peer order. Parked and gate-declined announcers are skipped.
 func (gs *GossipSubRouter) pickOfferedPeer(mid string) (peer.ID, bool) {
 	ot := gs.offers
 	offers := ot.offers[mid]
@@ -147,6 +147,9 @@ func (gs *GossipSubRouter) pickOfferedPeer(mid string) (peer.ID, bool) {
 	cands := make([]peer.ID, 0, len(offers))
 	for p := range offers {
 		if gs.peerParked(p) {
+			continue
+		}
+		if !gs.gateAllows(p, ot.topic[mid], mid) {
 			continue
 		}
 		cands = append(cands, p)
@@ -189,5 +192,6 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) {
 	}
 	gs.iasked[pick]++
 	gs.gossipTracer.AddPromise(pick, []string{mid})
+	gs.gateCommitted(pick, []string{mid})
 	gs.sendRPC(pick, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{mid}}}, nil, nil, nil), false)
 }
