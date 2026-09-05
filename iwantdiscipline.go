@@ -72,9 +72,60 @@ func (gs *GossipSubRouter) noteDelivered(mid string) {
 	gs.clearOffers(mid)
 }
 
-// clearIWantAsked drops expired outstanding-request records; called from the heartbeat.
-// Delivery deliberately does not clear an entry: a delivered id is seen, so no later IHAVE
-// can re-request it, and the entry ages out here.
+// undoIWantDispatch reverses the bookkeeping of IWANTs that were never transmitted.
+//
+// sendRPC reports queue admission, and a refused RPC is not retried. Everything the dispatch
+// path recorded beforehand -- the discipline window, the promise, the tracer promise, the
+// application's per-claim charge, the per-peer ask count -- therefore describes a request the
+// peer never received, and charging any of it blames a peer for our own send queue.
+//
+// The ask is deliberately not re-sent: a refusal at queue admission is backpressure on that
+// peer's queue, and answering it with another send is the retry storm. The peer instead cools
+// down for one window so the next selection rotates past it, and the offer table's record of
+// the attempt stays, because selection prefers untried announcers and forgetting the attempt
+// would make the peer whose queue is full the most attractive candidate again.
+func (gs *GossipSubRouter) undoIWantDispatch(p peer.ID, mids []string) {
+	if len(mids) == 0 {
+		return
+	}
+	if n := gs.iasked[p] - len(mids); n > 0 {
+		gs.iasked[p] = n
+	} else {
+		delete(gs.iasked, p)
+	}
+	gs.gossipTracer.dropPromise(p, mids)
+	gs.gateFailed(p, mids)
+	for _, mid := range mids {
+		if pk := gs.park; pk != nil {
+			if peers := pk.promised[mid]; peers != nil {
+				delete(peers, p)
+				if len(peers) == 0 {
+					delete(pk.promised, mid)
+				}
+			}
+		}
+		if gs.iwantAsked != nil {
+			delete(gs.iwantAsked, mid)
+		}
+	}
+	if gs.iwantAsked != nil {
+		if gs.iwantRefused == nil {
+			gs.iwantRefused = make(map[peer.ID]time.Time)
+		}
+		gs.iwantRefused[p] = time.Now()
+	}
+}
+
+// sendRefusedRecently reports whether an IWANT to p was refused at queue admission within the
+// last window, in which case selection should rotate past it.
+func (gs *GossipSubRouter) sendRefusedRecently(p peer.ID) bool {
+	at, ok := gs.iwantRefused[p]
+	return ok && time.Since(at) < gs.iwantWindow
+}
+
+// clearIWantAsked drops expired outstanding-request records and lapsed cooldowns; called from
+// the heartbeat. Delivery deliberately does not clear a request record: a delivered id is
+// seen, so no later IHAVE can re-request it, and the entry ages out here.
 func (gs *GossipSubRouter) clearIWantAsked() {
 	if gs.iwantAsked == nil {
 		return
@@ -82,6 +133,11 @@ func (gs *GossipSubRouter) clearIWantAsked() {
 	for mid, at := range gs.iwantAsked {
 		if time.Since(at) >= gs.iwantWindow {
 			delete(gs.iwantAsked, mid)
+		}
+	}
+	for p, at := range gs.iwantRefused {
+		if time.Since(at) >= gs.iwantWindow {
+			delete(gs.iwantRefused, p)
 		}
 	}
 }

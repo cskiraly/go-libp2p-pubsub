@@ -14,12 +14,18 @@ import (
 type recordingGate struct {
 	allow     func(topic, mid string) bool
 	committed func(mids []string)
+	failed    func(mids []string)
 }
 
 func (g *recordingGate) Allow(_ peer.ID, topic, mid string) bool { return g.allow(topic, mid) }
 func (g *recordingGate) Committed(_ peer.ID, mids []string) {
 	if g.committed != nil {
 		g.committed(mids)
+	}
+}
+func (g *recordingGate) Failed(_ peer.ID, mids []string) {
+	if g.failed != nil {
+		g.failed(mids)
 	}
 }
 

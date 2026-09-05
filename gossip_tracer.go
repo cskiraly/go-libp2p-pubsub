@@ -74,6 +74,36 @@ func (gt *gossipTracer) AddPromise(p peer.ID, msgIDs []string) {
 	}
 }
 
+// dropPromise forgets promises to p for msgIDs. It exists for requests that were never
+// transmitted: sendRPC can refuse an RPC at queue admission, and a promise recorded for an
+// IWANT that never left this node would score the peer for failing to answer a question it
+// was never asked.
+func (gt *gossipTracer) dropPromise(p peer.ID, msgIDs []string) {
+	if gt == nil {
+		return
+	}
+
+	gt.Lock()
+	defer gt.Unlock()
+
+	for _, mid := range msgIDs {
+		promises, ok := gt.promises[mid]
+		if !ok {
+			continue
+		}
+		delete(promises, p)
+		if len(promises) == 0 {
+			delete(gt.promises, mid)
+		}
+		if peerPromises, ok := gt.peerPromises[p]; ok {
+			delete(peerPromises, mid)
+			if len(peerPromises) == 0 {
+				delete(gt.peerPromises, p)
+			}
+		}
+	}
+}
+
 // returns the number of broken promises for each peer who didn't follow up
 // on an IWANT request.
 func (gt *gossipTracer) GetBrokenPromises() map[peer.ID]int {

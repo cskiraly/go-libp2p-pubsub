@@ -35,6 +35,11 @@ type RequestGate interface {
 	// Committed reports the ids actually dispatched in an IWANT to p. This is the only place an
 	// application may charge per-claim budgets or record provenance.
 	Committed(p peer.ID, mids []string)
+	// Failed reports ids that Committed charged but whose IWANT was never transmitted, so the
+	// application can release what it reserved. Without it a charge outlives the request that
+	// justified it: an allowance spent on a message that was never asked for can never be
+	// spent on the one that is.
+	Failed(p peer.ID, mids []string)
 }
 
 // RequestDeferral is the router-side ledger of announcements a gate declined, plus the trigger
@@ -117,6 +122,13 @@ func (gs *GossipSubRouter) gateAllows(p peer.ID, topic, mid string) bool {
 func (gs *GossipSubRouter) gateCommitted(p peer.ID, mids []string) {
 	if gs.requestGate != nil {
 		gs.requestGate.Committed(p, mids)
+	}
+}
+
+// gateFailed reports an IWANT that was never transmitted to the gate, if any.
+func (gs *GossipSubRouter) gateFailed(p peer.ID, mids []string) {
+	if gs.requestGate != nil {
+		gs.requestGate.Failed(p, mids)
 	}
 }
 
@@ -222,7 +234,12 @@ func (gs *GossipSubRouter) replayDeferred() {
 		gs.iasked[pid] += len(lst)
 		gs.gossipTracer.AddPromise(pid, lst)
 		gs.gateCommitted(pid, lst)
-		gs.sendRPC(pid, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: lst}}, nil, nil, nil), false)
+		if !gs.sendRPC(pid, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: lst}}, nil, nil, nil), false) {
+			// Never transmitted: undo the charges and keep the deferral, so the next replay
+			// can try again rather than losing the announcement to our own queue.
+			gs.undoIWantDispatch(pid, lst)
+			continue
+		}
 		for _, mid := range lst {
 			delete(gs.deferred, mid)
 		}

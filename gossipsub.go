@@ -320,7 +320,7 @@ func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
 		if rt.score != nil {
 			rt.score.AddPenalty(p, 10)
 		}
-	}, rt.sendRPC)
+	}, func(p peer.ID, out *RPC, urgent bool) { rt.sendRPC(p, out, urgent) })
 
 	return rt
 }
@@ -605,6 +605,7 @@ type GossipSubRouter struct {
 	iwantWindow  time.Duration                    // optional one-outstanding-IWANT-per-id window
 	iwantMatch   func(topic string) bool          // topics the discipline applies to; nil = all
 	iwantAsked   map[string]time.Time             // message ids with an IWANT in flight, by request time
+	iwantRefused map[peer.ID]time.Time            // peers whose last IWANT was refused at queue admission, cooling down
 	park         *commitmentPark                  // optional: IHAVE is a binding offer; unserved asks park the announcer
 	offers       *offerTable                      // optional: remembered announcers, re-asked when the discipline moves on
 	requestGate  RequestGate                      // optional application veto on requesting an announced id
@@ -942,8 +943,18 @@ func (gs *GossipSubRouter) HandleRPC(rpc *RPC) {
 		return
 	}
 
+	// The ids this RPC asks for, so their bookkeeping can be undone if the RPC is refused at
+	// queue admission: a promise or a per-claim charge recorded for a request that never left
+	// this node would blame the peer for our own send queue.
+	var asked []string
+	for _, iw := range iwant {
+		asked = append(asked, iw.GetMessageIDs()...)
+	}
+
 	out := rpcWithControl(iWantResponses, nil, iwant, nil, prune, nil)
-	gs.sendRPC(rpc.from, out, false)
+	if !gs.sendRPC(rpc.from, out, false) {
+		gs.undoIWantDispatch(rpc.from, asked)
+	}
 }
 
 func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.ControlIWant {
@@ -1621,12 +1632,16 @@ func (gs *GossipSubRouter) sendPrune(p peer.ID, topic string, isUnsubscribe bool
 	gs.sendRPC(p, out, false)
 }
 
-func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC, urgent bool) {
+// sendRPC reports whether out was admitted to the peer's send queue. A refused RPC is not
+// retried: control is regenerated, not remembered, so a caller that recorded state for a
+// request must undo it when this returns false. Piggybacked control and gossip are unaffected
+// either way; doDropRPC re-queues them.
+func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC, urgent bool) bool {
 	q, ok := gs.p.peers[p]
 	if !ok {
 		// No queue to send to this peer. Nothing to do.
 		gs.doDropRPC(out, p, "No send queue for peer. Can't send RPC")
-		return
+		return false
 	}
 
 	// Any pending control messages?
@@ -1667,17 +1682,22 @@ func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC, urgent bool) {
 
 	// If we're below the max message size, go ahead and send
 	if !out.exceedsSizeLimits(gs.p.maxMessageSize, gs.p.maxControlMessageSize) {
-		gs.doSendRPC(out, p, q, urgent)
-		return
+		return gs.doSendRPC(out, p, q, urgent)
 	}
 
-	// Potentially split the RPC into multiple RPCs that are below the max message size
+	// Potentially split the RPC into multiple RPCs that are below the max message size.
+	// Admitted only if every fragment was: a partially delivered request is not a request.
+	admitted := true
 	for rpc := range out.split(gs.p.maxMessageSize, gs.p.maxControlMessageSize) {
 		if dropIfOversized(rpc) {
+			admitted = false
 			continue
 		}
-		gs.doSendRPC(rpc, p, q, urgent)
+		if !gs.doSendRPC(rpc, p, q, urgent) {
+			admitted = false
+		}
 	}
+	return admitted
 }
 
 func (gs *GossipSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
@@ -1690,7 +1710,8 @@ func (gs *GossipSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
 	}
 }
 
-func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, urgent bool) {
+// doSendRPC reports whether the RPC was admitted to the queue.
+func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, urgent bool) bool {
 	var err error
 	if urgent {
 		err = q.UrgentPush(rpc, false)
@@ -1699,9 +1720,10 @@ func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, urgent bo
 	}
 	if err != nil {
 		gs.doDropRPC(rpc, p, "queue full")
-		return
+		return false
 	}
 	gs.tracer.SendRPC(rpc, p)
+	return true
 }
 
 func (gs *GossipSubRouter) heartbeatTimer() {

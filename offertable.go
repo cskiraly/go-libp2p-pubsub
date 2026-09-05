@@ -158,8 +158,9 @@ func (gs *GossipSubRouter) sweepOffers() {
 }
 
 // pickOfferedPeer chooses the announcer to re-ask for mid: untried first, then least recently
-// tried, in deterministic peer order. Parked and gate-declined announcers are skipped, and so
-// is any announcer whose earlier ask for this id is still unjudged; waiting reports whether at
+// tried, in deterministic peer order. Disconnected, parked, cooling-down and gate-declined
+// announcers are skipped, and so is any announcer whose earlier ask for this id is still
+// unjudged; waiting reports whether at
 // least one announcer was skipped for that reason, since that state resolves on its own clock
 // (delivery or the promise deadline) and is worth coming back for.
 func (gs *GossipSubRouter) pickOfferedPeer(mid string) (pick peer.ID, found, waiting bool) {
@@ -170,7 +171,10 @@ func (gs *GossipSubRouter) pickOfferedPeer(mid string) (pick peer.ID, found, wai
 	}
 	cands := make([]peer.ID, 0, len(offers))
 	for p := range offers {
-		if gs.peerParked(p) {
+		if _, connected := gs.p.peers[p]; !connected {
+			continue // the announcer left; nothing to send to
+		}
+		if gs.peerParked(p) || gs.sendRefusedRecently(p) {
 			continue
 		}
 		if gs.promiseOpen(mid, p) {
@@ -229,5 +233,10 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) {
 	gs.iasked[pick]++
 	gs.gossipTracer.AddPromise(pick, []string{mid})
 	gs.gateCommitted(pick, []string{mid})
-	gs.sendRPC(pick, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{mid}}}, nil, nil, nil), false)
+	if !gs.sendRPC(pick, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{mid}}}, nil, nil, nil), false) {
+		// Never transmitted: undo the charges and come back once the cooldown has rotated
+		// selection past this peer.
+		gs.undoIWantDispatch(pick, []string{mid})
+		gs.armOfferRetry(mid)
+	}
 }

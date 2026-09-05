@@ -13,8 +13,13 @@ import (
 func newOfferRouter() *GossipSubRouter {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	// Every announcer the tests name is connected: selection skips peers without a send queue.
+	peers := make(map[peer.ID]*rpcQueue)
+	for _, p := range []string{"announcer-a", "announcer-b", "announcer-c"} {
+		peers[peer.ID(p)] = newRpcQueue(8)
+	}
 	return &GossipSubRouter{
-		p:           &PubSub{ctx: ctx, eval: make(chan func()), seenMessages: timecache.NewTimeCache(time.Minute)},
+		p:           &PubSub{ctx: ctx, eval: make(chan func()), peers: peers, seenMessages: timecache.NewTimeCache(time.Minute)},
 		iwantAsked:  make(map[string]time.Time),
 		iwantWindow: time.Minute,
 		offers: &offerTable{
