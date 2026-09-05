@@ -67,6 +67,42 @@ func TestIHaveReplyIWantIsUrgent(t *testing.T) {
 	}
 }
 
+func TestIHaveReplyIWantWinsLastQueueSlot(t *testing.T) {
+	full, open := peer.ID("full"), peer.ID("open")
+	gs, oq := newRefusalRouter(t, full, open)
+	oq.maxSize = 2
+	gs.extensions = newExtensionsState(PeerExtensions{}, func(peer.ID) {}, func(p peer.ID, out *RPC, urgent bool) { gs.sendRPC(p, out, urgent) })
+	gs.p.peerFilter = DefaultPeerFilter
+	gs.params = DefaultGossipSubParams()
+	gs.mesh = map[string]map[peer.ID]struct{}{"t": {open: {}}}
+	gs.peerhave = make(map[peer.ID]int)
+	gs.mcache = NewMessageCache(1, 1)
+	served := makeTestMessage(1)
+	servedID := DefaultMsgIdFn(served)
+	gs.mcache.Put(&Message{Message: served})
+
+	backlog := rpcWithMessages(&pb.Message{Data: []byte("backlog")})
+	if err := oq.Push(backlog, false); err != nil {
+		t.Fatal(err)
+	}
+	topic := "t"
+	gs.HandleRPC(&RPC{from: open, RPC: pb.RPC{Control: &pb.ControlMessage{
+		Ihave: []*pb.ControlIHave{{TopicID: &topic, MessageIDs: []string{"pull"}}},
+		Iwant: []*pb.ControlIWant{{MessageIDs: []string{servedID}}},
+	}}})
+
+	first := popNext(t, oq)
+	if got := first.Control.GetIwant(); len(got) != 1 || got[0].GetMessageIDs()[0] != "pull" {
+		t.Fatalf("first RPC out is %v, want the urgent IWANT", first)
+	}
+	if got := popNext(t, oq); got != backlog {
+		t.Fatal("the response took the last slot instead of being dropped")
+	}
+	if got := oq.queue.Len(); got != 0 {
+		t.Fatalf("queue contains %d extra RPCs after the response was dropped", got)
+	}
+}
+
 func TestSendRPCReportsNormalSendPiggyback(t *testing.T) {
 	full, open := peer.ID("full"), peer.ID("open")
 	gs, oq := newRefusalRouter(t, full, open)
