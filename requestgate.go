@@ -234,7 +234,7 @@ func (gs *GossipSubRouter) replayDeferred() {
 		gs.iasked[pid] += len(lst)
 		gs.gossipTracer.AddPromise(pid, lst)
 		gs.gateCommitted(pid, lst)
-		if !gs.sendRPC(pid, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: lst}}, nil, nil, nil), false) {
+		if !gs.sendRPC(pid, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: lst}}, nil, nil, nil), true) {
 			// Never transmitted: undo the charges and keep the deferral, so the next replay
 			// can try again rather than losing the announcement to our own queue.
 			gs.undoIWantDispatch(pid, lst)

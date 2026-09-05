@@ -233,7 +233,7 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) {
 	gs.iasked[pick]++
 	gs.gossipTracer.AddPromise(pick, []string{mid})
 	gs.gateCommitted(pick, []string{mid})
-	if !gs.sendRPC(pick, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{mid}}}, nil, nil, nil), false) {
+	if !gs.sendRPC(pick, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{mid}}}, nil, nil, nil), true) {
 		// Never transmitted: undo the charges and come back once the cooldown has rotated
 		// selection past this peer.
 		gs.undoIWantDispatch(pick, []string{mid})

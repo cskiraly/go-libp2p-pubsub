@@ -943,16 +943,26 @@ func (gs *GossipSubRouter) HandleRPC(rpc *RPC) {
 		return
 	}
 
-	// The ids this RPC asks for, so their bookkeeping can be undone if the RPC is refused at
-	// queue admission: a promise or a per-claim charge recorded for a request that never left
-	// this node would blame the peer for our own send queue.
+	// Responses and prunes go out on the normal lane as before. The IWANT goes out on its own,
+	// on the urgent lane: it is tens of bytes, and behind the data queued to this peer it would
+	// wait out our own backlog before the peer even sees it, which delays the pull, lets the
+	// discipline window expire on a request still sitting here, and charges the peer's promise
+	// for time it never had. Unlike an IHAVE, an early IWANT misleads nobody: the announcer is
+	// already chosen, and the response travels the other direction, on the peer's queue.
+	if len(iWantResponses) > 0 || len(prune) > 0 {
+		gs.sendRPC(rpc.from, rpcWithControl(iWantResponses, nil, nil, nil, prune, nil), false)
+	}
+	if len(iwant) == 0 {
+		return
+	}
+	// The ids asked for, so their bookkeeping can be undone if the RPC is refused at queue
+	// admission: a promise or a per-claim charge recorded for a request that never left this
+	// node would blame the peer for our own send queue.
 	var asked []string
 	for _, iw := range iwant {
 		asked = append(asked, iw.GetMessageIDs()...)
 	}
-
-	out := rpcWithControl(iWantResponses, nil, iwant, nil, prune, nil)
-	if !gs.sendRPC(rpc.from, out, false) {
+	if !gs.sendRPC(rpc.from, rpcWithControl(nil, nil, iwant, nil, nil, nil), true) {
 		gs.undoIWantDispatch(rpc.from, asked)
 	}
 }
