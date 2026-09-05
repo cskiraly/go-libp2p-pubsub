@@ -9,9 +9,9 @@ import (
 )
 
 func newParkRouter(k int, promise, ttl time.Duration) *GossipSubRouter {
-	// No pubsub loop: the tests below call promiseDue directly, which is what notePromise's
-	// timer does on the router goroutine. A cancelled context lets any timer that does fire
-	// return instead of blocking on eval.
+	// No pubsub loop: the tests below call promiseDue or sweepPromises directly, which is what
+	// the queue's timer does on the router goroutine. A cancelled context lets any timer that
+	// does fire return instead of blocking on eval.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	gs := &GossipSubRouter{
@@ -133,6 +133,63 @@ func TestCommitmentPark(t *testing.T) {
 		time.Sleep(30 * time.Millisecond)
 		if gs.peerParked(a) {
 			t.Fatal("still parked after the ttl")
+		}
+	})
+
+	t.Run("asks share one timer and are judged in ask order from the queue", func(t *testing.T) {
+		gs := newParkRouter(10, 10*time.Millisecond, time.Hour)
+		for _, mid := range []string{"m1", "m2", "m3"} {
+			if !gs.iwantAllowed(mid, "t", a) {
+				t.Fatalf("ask for %s refused", mid)
+			}
+		}
+		if n := len(gs.park.due); n != 3 {
+			t.Fatalf("%d judgments queued, want 3", n)
+		}
+		if !gs.park.armed {
+			t.Fatal("no timer armed for the head of the queue")
+		}
+		time.Sleep(15 * time.Millisecond)
+		gs.sweepPromises()
+		if gs.park.breaks[a] != 3 {
+			t.Fatalf("breaks = %d after the sweep, want 3", gs.park.breaks[a])
+		}
+		if len(gs.park.due) != 0 || gs.park.armed {
+			t.Fatal("an empty queue left a timer armed or entries behind")
+		}
+	})
+
+	t.Run("a sweep judges only what is due and re-arms for the rest", func(t *testing.T) {
+		gs := newParkRouter(10, 20*time.Millisecond, time.Hour)
+		if !gs.iwantAllowed("m1", "t", a) {
+			t.Fatal("ask refused")
+		}
+		time.Sleep(25 * time.Millisecond)
+		if !gs.iwantAllowed("m2", "t", a) {
+			t.Fatal("ask refused")
+		}
+		gs.sweepPromises()
+		if gs.park.breaks[a] != 1 {
+			t.Fatalf("breaks = %d, want 1: only m1 was due", gs.park.breaks[a])
+		}
+		if len(gs.park.due) != 1 || gs.park.due[0].mid != "m2" || !gs.park.armed {
+			t.Fatal("the not-yet-due ask was not kept queued with a timer armed")
+		}
+	})
+
+	t.Run("a kept promise is skipped at its deadline", func(t *testing.T) {
+		gs := newParkRouter(1, 10*time.Millisecond, time.Hour)
+		if !gs.iwantAllowed("m", "t", a) {
+			t.Fatal("ask refused")
+		}
+		gs.noteDelivered("m")
+		time.Sleep(15 * time.Millisecond)
+		gs.sweepPromises()
+		if gs.peerParked(a) || gs.park.breaks[a] != 0 {
+			t.Fatal("a served ask was charged from the queue")
+		}
+		if len(gs.park.due) != 0 {
+			t.Fatal("the queue kept a judged entry")
 		}
 	})
 

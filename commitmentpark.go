@@ -27,6 +27,21 @@ type commitmentPark struct {
 	promised map[string]map[peer.ID]time.Time // open promises per id: every peer asked, and when
 	breaks   map[peer.ID]int                  // broken-promise counts
 	parked   map[peer.ID]time.Time            // parked peers by expiry
+
+	// due is the judgment queue: every ask in ask order, with one timer armed for the head.
+	// Every promise runs for the same duration, so ask order is deadline order and a FIFO
+	// judges each ask at its own deadline without a timer per ask. If the promise duration
+	// ever varies per peer (measured timers), this must become a min-heap on the deadline:
+	// the head of a FIFO would no longer be the earliest.
+	due   []promiseDeadline
+	armed bool // a timer for the head of due is in flight
+}
+
+// promiseDeadline is one queued judgment: the ask it belongs to, due at at+promise.
+type promiseDeadline struct {
+	mid string
+	p   peer.ID
+	at  time.Time
 }
 
 // WithIHaveCommitmentPark treats an IHAVE as a binding offer under the IWANT discipline: an ask
@@ -68,9 +83,9 @@ func (gs *GossipSubRouter) promiseOpen(mid string, p peer.ID) bool {
 	return open
 }
 
-// notePromise opens a promise for an ask just granted and schedules its judgment on the
-// router goroutine. An open promise is never overwritten: its deadline belongs to the first
-// ask, and the timer captured that timestamp.
+// notePromise opens a promise for an ask just granted and queues its judgment. An open promise
+// is never overwritten: its deadline belongs to the first ask, and the queue entry carries
+// that timestamp.
 func (gs *GossipSubRouter) notePromise(mid string, from peer.ID, askedAt time.Time) {
 	pk := gs.park
 	if pk == nil {
@@ -83,16 +98,50 @@ func (gs *GossipSubRouter) notePromise(mid string, from peer.ID, askedAt time.Ti
 		return
 	}
 	pk.promised[mid][from] = askedAt
-	time.AfterFunc(pk.promise, func() {
+	pk.due = append(pk.due, promiseDeadline{mid: mid, p: from, at: askedAt})
+	gs.armPromiseSweep()
+}
+
+// armPromiseSweep schedules one judgment pass for the head of the queue unless a pass is
+// already in flight. The pass runs on the router goroutine, judges every promise that is due
+// and re-arms for the next head, so however many asks are open there is one timer.
+func (gs *GossipSubRouter) armPromiseSweep() {
+	pk := gs.park
+	if pk.armed || len(pk.due) == 0 {
+		return
+	}
+	pk.armed = true
+	time.AfterFunc(time.Until(pk.due[0].at.Add(pk.promise)), func() {
 		select {
-		case gs.p.eval <- func() { gs.promiseDue(mid, from, askedAt) }:
+		case gs.p.eval <- gs.sweepPromises:
 		case <-gs.p.ctx.Done():
 		}
 	})
 }
 
+// sweepPromises judges every queued ask whose deadline has passed, in ask order, then re-arms
+// for the next one. Runs on the router goroutine.
+func (gs *GossipSubRouter) sweepPromises() {
+	pk := gs.park
+	if pk == nil {
+		return
+	}
+	now := time.Now()
+	for len(pk.due) > 0 && !pk.due[0].at.Add(pk.promise).After(now) {
+		d := pk.due[0]
+		pk.due[0] = promiseDeadline{}
+		pk.due = pk.due[1:]
+		gs.promiseDue(d.mid, d.p, d.at)
+	}
+	if len(pk.due) == 0 {
+		pk.due = nil
+	}
+	pk.armed = false
+	gs.armPromiseSweep()
+}
+
 // promiseDue runs on the router goroutine at this peer's promise deadline. A promise already
-// kept (delivery of the id, from anyone) or re-made (a newer ask to the same peer) is not
+// kept (delivery of the id, from anyone) or undone (the ask never left the send queue) is not
 // charged; an open one breaks: the asked peer is charged and possibly parked. The discipline
 // slot is refunded only when this ask is still the current one; a shorter window has usually
 // moved on already, and then there is nothing left to refund.
