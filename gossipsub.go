@@ -1645,8 +1645,8 @@ func (gs *GossipSubRouter) sendPrune(p peer.ID, topic string, isUnsubscribe bool
 
 // sendRPC reports whether out was admitted to the peer's send queue. A refused RPC is not
 // retried: control is regenerated, not remembered, so a caller that recorded state for a
-// request must undo it when this returns false. Piggybacked control and gossip are unaffected
-// either way; doDropRPC re-queues them.
+// request must undo it when this returns false. Normal sends first flush pending control and
+// gossip; urgent sends carry only out so they cannot promote normal-lane traffic.
 func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC, urgent bool) bool {
 	q, ok := gs.p.peers[p]
 	if !ok {
@@ -1655,20 +1655,6 @@ func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC, urgent bool) bool {
 		return false
 	}
 
-	// Any pending control messages?
-	var controlMessage RPC
-	ctl, ok := gs.control[p]
-	if ok {
-		gs.piggybackControl(p, &controlMessage, ctl)
-		delete(gs.control, p)
-	}
-	ihave, ok := gs.gossip[p]
-	if ok {
-		gs.piggybackGossip(p, &controlMessage, ihave)
-		delete(gs.gossip, p)
-	}
-
-	controlSize := proto.Size(&controlMessage.RPC)
 	dropIfOversized := func(rpc *RPC) bool {
 		if !rpc.exceedsSizeLimits(gs.p.maxMessageSize, gs.p.maxControlMessageSize) {
 			return false
@@ -1678,15 +1664,32 @@ func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC, urgent bool) bool {
 		gs.doDropRPC(rpc, p, fmt.Sprintf("Dropping oversized RPC. Size: %d, limit: %d. Control size: %d, control limit: %d", size, gs.p.maxMessageSize, controlSize, gs.p.maxControlMessageSize))
 		return true
 	}
-	if controlSize > 0 {
-		if !controlMessage.exceedsSizeLimits(gs.p.maxMessageSize, gs.p.maxControlMessageSize) {
-			gs.doSendRPC(&controlMessage, p, q, urgent)
-		} else {
-			for rpc := range controlMessage.split(gs.p.maxMessageSize, gs.p.maxControlMessageSize) {
-				if dropIfOversized(rpc) {
-					continue
+
+	if !urgent {
+		// Any pending control messages?
+		var controlMessage RPC
+		ctl, ok := gs.control[p]
+		if ok {
+			gs.piggybackControl(p, &controlMessage, ctl)
+			delete(gs.control, p)
+		}
+		ihave, ok := gs.gossip[p]
+		if ok {
+			gs.piggybackGossip(p, &controlMessage, ihave)
+			delete(gs.gossip, p)
+		}
+
+		controlSize := proto.Size(&controlMessage.RPC)
+		if controlSize > 0 {
+			if !controlMessage.exceedsSizeLimits(gs.p.maxMessageSize, gs.p.maxControlMessageSize) {
+				gs.doSendRPC(&controlMessage, p, q, false)
+			} else {
+				for rpc := range controlMessage.split(gs.p.maxMessageSize, gs.p.maxControlMessageSize) {
+					if dropIfOversized(rpc) {
+						continue
+					}
+					gs.doSendRPC(rpc, p, q, false)
 				}
-				gs.doSendRPC(rpc, p, q, urgent)
 			}
 		}
 	}

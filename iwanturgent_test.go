@@ -22,7 +22,7 @@ func popNext(t *testing.T, q *rpcQueue) *RPC {
 }
 
 // TestIHaveReplyIWantIsUrgent: the IWANT that answers an IHAVE overtakes data already queued to
-// the same peer, while the data responses in the same reply stay behind it.
+// the same peer, while pending gossip stays on the normal lane behind that data.
 func TestIHaveReplyIWantIsUrgent(t *testing.T) {
 	full, open := peer.ID("full"), peer.ID("open")
 	gs, oq := newRefusalRouter(t, full, open)
@@ -36,11 +36,19 @@ func TestIHaveReplyIWantIsUrgent(t *testing.T) {
 	if err := oq.Push(backlog, false); err != nil {
 		t.Fatal(err)
 	}
+	pendingTopic := "pending"
+	gs.gossip = map[peer.ID][]*pb.ControlIHave{
+		open: {{TopicID: &pendingTopic, MessageIDs: []string{"pending"}}},
+	}
 
 	topic := "t"
 	gs.HandleRPC(&RPC{from: open, RPC: pb.RPC{Control: &pb.ControlMessage{
 		Ihave: []*pb.ControlIHave{{TopicID: &topic, MessageIDs: []string{"m"}}},
 	}}})
+	if got := gs.gossip[open]; len(got) != 1 || got[0].GetMessageIDs()[0] != "pending" {
+		t.Fatalf("urgent IWANT drained pending gossip: %v", got)
+	}
+	gs.flush()
 
 	first := popNext(t, oq)
 	if got := first.Control.GetIwant(); len(got) != 1 || got[0].GetMessageIDs()[0] != "m" {
@@ -52,6 +60,34 @@ func TestIHaveReplyIWantIsUrgent(t *testing.T) {
 	second := popNext(t, oq)
 	if second != backlog {
 		t.Fatal("the backlog was not the next RPC out")
+	}
+	third := popNext(t, oq)
+	if got := third.Control.GetIhave(); len(got) != 1 || got[0].GetMessageIDs()[0] != "pending" {
+		t.Fatalf("third RPC out carries %v, want the pending IHAVE", got)
+	}
+}
+
+func TestSendRPCReportsNormalSendPiggyback(t *testing.T) {
+	full, open := peer.ID("full"), peer.ID("open")
+	gs, oq := newRefusalRouter(t, full, open)
+	topic := "t"
+	gs.gossip = map[peer.ID][]*pb.ControlIHave{
+		open: {{TopicID: &topic, MessageIDs: []string{"m"}}},
+	}
+	payload := rpcWithMessages(&pb.Message{Data: []byte("segment")})
+
+	if !gs.sendRPC(open, payload, false) {
+		t.Fatal("normal send was refused")
+	}
+	if _, pending := gs.gossip[open]; pending {
+		t.Fatal("normal send left gossip pending")
+	}
+	first := popNext(t, oq)
+	if got := first.Control.GetIhave(); len(got) != 1 || got[0].GetMessageIDs()[0] != "m" {
+		t.Fatalf("first RPC out carries %v, want the piggybacked IHAVE", got)
+	}
+	if got := popNext(t, oq); got != payload {
+		t.Fatal("payload was not queued after the piggybacked gossip")
 	}
 }
 
