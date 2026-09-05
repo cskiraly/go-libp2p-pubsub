@@ -1791,9 +1791,10 @@ func (gs *GossipSubRouter) heartbeat() {
 	// clean up IDONTWANT counters
 	gs.clearIDontWantCounters()
 
-	// expire outstanding-IWANT records and stale offers
+	// expire outstanding-IWANT records, stale offers, expired parks and stale breaks
 	gs.clearIWantAsked()
 	gs.sweepOffers()
+	gs.sweepPark()
 
 	// apply IWANT request penalties
 	gs.applyIwantPenalties()

@@ -21,7 +21,7 @@ func newParkRouter(k int, promise, ttl time.Duration) *GossipSubRouter {
 		park: &commitmentPark{
 			k: k, ttl: ttl, promise: promise,
 			promised: make(map[string]map[peer.ID]time.Time),
-			breaks:   make(map[peer.ID]int),
+			breaks:   make(map[peer.ID]breakRecord),
 			parked:   make(map[peer.ID]time.Time),
 		},
 	}
@@ -79,8 +79,8 @@ func TestCommitmentPark(t *testing.T) {
 		if gs.peerParked(a) {
 			t.Fatal("a served ask was charged as a break")
 		}
-		if gs.park.breaks[a] != 0 {
-			t.Fatalf("breaks = %d after delivery, want 0", gs.park.breaks[a])
+		if gs.park.breaks[a].n != 0 {
+			t.Fatalf("breaks = %d after delivery, want 0", gs.park.breaks[a].n)
 		}
 	})
 
@@ -134,6 +134,36 @@ func TestCommitmentPark(t *testing.T) {
 		if gs.peerParked(a) {
 			t.Fatal("still parked after the ttl")
 		}
+		if _, kept := gs.park.breaks[a]; kept {
+			t.Fatal("the expired park left its breaks behind, so the next break would re-park at once")
+		}
+	})
+
+	t.Run("the heartbeat sweep lifts expired parks and forgets stale breaks", func(t *testing.T) {
+		gs := newParkRouter(2, time.Second, time.Minute)
+		// a: parked, park expired. b: one break below k, stale. c: one break, fresh.
+		c := peer.ID("announcer-c")
+		for _, mid := range []string{"m1", "m2"} {
+			gs.promiseDue(mid, a, gs.askForTest(mid, a))
+		}
+		gs.park.parked[a] = time.Now().Add(-time.Second)
+		gs.promiseDue("m3", b, gs.askForTest("m3", b))
+		gs.park.breaks[b] = breakRecord{n: 1, last: time.Now().Add(-2 * time.Minute)}
+		gs.promiseDue("m4", c, gs.askForTest("m4", c))
+
+		gs.sweepPark()
+		if _, parked := gs.park.parked[a]; parked {
+			t.Fatal("an expired park survived the sweep")
+		}
+		if _, kept := gs.park.breaks[a]; kept {
+			t.Fatal("the lifted park kept its breaks")
+		}
+		if _, kept := gs.park.breaks[b]; kept {
+			t.Fatal("a stale break below k survived the sweep")
+		}
+		if b := gs.park.breaks[c]; b.n != 1 {
+			t.Fatalf("a fresh break was swept: n = %d, want 1", b.n)
+		}
 	})
 
 	t.Run("asks share one timer and are judged in ask order from the queue", func(t *testing.T) {
@@ -151,8 +181,8 @@ func TestCommitmentPark(t *testing.T) {
 		}
 		time.Sleep(15 * time.Millisecond)
 		gs.sweepPromises()
-		if gs.park.breaks[a] != 3 {
-			t.Fatalf("breaks = %d after the sweep, want 3", gs.park.breaks[a])
+		if gs.park.breaks[a].n != 3 {
+			t.Fatalf("breaks = %d after the sweep, want 3", gs.park.breaks[a].n)
 		}
 		if len(gs.park.due) != 0 || gs.park.armed {
 			t.Fatal("an empty queue left a timer armed or entries behind")
@@ -169,8 +199,8 @@ func TestCommitmentPark(t *testing.T) {
 			t.Fatal("ask refused")
 		}
 		gs.sweepPromises()
-		if gs.park.breaks[a] != 1 {
-			t.Fatalf("breaks = %d, want 1: only m1 was due", gs.park.breaks[a])
+		if gs.park.breaks[a].n != 1 {
+			t.Fatalf("breaks = %d, want 1: only m1 was due", gs.park.breaks[a].n)
 		}
 		if len(gs.park.due) != 1 || gs.park.due[0].mid != "m2" || !gs.park.armed {
 			t.Fatal("the not-yet-due ask was not kept queued with a timer armed")
@@ -185,7 +215,7 @@ func TestCommitmentPark(t *testing.T) {
 		gs.noteDelivered("m")
 		time.Sleep(15 * time.Millisecond)
 		gs.sweepPromises()
-		if gs.peerParked(a) || gs.park.breaks[a] != 0 {
+		if gs.peerParked(a) || gs.park.breaks[a].n != 0 {
 			t.Fatal("a served ask was charged from the queue")
 		}
 		if len(gs.park.due) != 0 {

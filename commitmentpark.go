@@ -12,9 +12,14 @@ import (
 // Under the IWANT discipline a receiver asks one announcer per id and moves on only when the
 // window expires, so an announcer that never serves costs the receiver a window per id. The
 // park makes the offer binding: each ask opens a per-(id, peer) promise with its own deadline;
-// a promise still unserved at the deadline is a break, and a peer reaching k breaks is parked,
-// its announcements ineligible for pull selection, for ttl. Delivery of the id from anyone
-// keeps every open promise for it.
+// a promise still unserved at the deadline is a break, and a peer reaching k breaks within
+// ttl is parked, its announcements ineligible for pull selection, for ttl. Delivery of the id
+// from anyone keeps every open promise for it. A park that expires takes the breaks that
+// caused it with it, and a break that never reached k is forgotten after ttl: the evidence has
+// the same shelf life as the penalty.
+//
+// Nothing here is cleared on disconnect. A parked peer that could reset its park by
+// reconnecting would not be parked at all; every ledger ages out on its own clock instead.
 //
 // The promise deadline is independent of the discipline window (two timers): a short window
 // moves on and re-asks elsewhere while the slow peer still runs to judgment. Park gates pull
@@ -25,7 +30,7 @@ type commitmentPark struct {
 	promise time.Duration // deadline for serving an ask
 
 	promised map[string]map[peer.ID]time.Time // open promises per id: every peer asked, and when
-	breaks   map[peer.ID]int                  // broken-promise counts
+	breaks   map[peer.ID]breakRecord          // broken promises per peer, below k
 	parked   map[peer.ID]time.Time            // parked peers by expiry
 
 	// due is the judgment queue: every ask in ask order, with one timer armed for the head.
@@ -42,6 +47,13 @@ type promiseDeadline struct {
 	mid string
 	p   peer.ID
 	at  time.Time
+}
+
+// breakRecord counts a peer's broken promises and remembers the latest, so a count that never
+// reached k can age out.
+type breakRecord struct {
+	n    int
+	last time.Time
 }
 
 // WithIHaveCommitmentPark treats an IHAVE as a binding offer under the IWANT discipline: an ask
@@ -64,7 +76,7 @@ func WithIHaveCommitmentPark(k int, promise, ttl time.Duration) Option {
 			ttl:      ttl,
 			promise:  promise,
 			promised: make(map[string]map[peer.ID]time.Time),
-			breaks:   make(map[peer.ID]int),
+			breaks:   make(map[peer.ID]breakRecord),
 			parked:   make(map[peer.ID]time.Time),
 		}
 		return nil
@@ -172,14 +184,18 @@ func (gs *GossipSubRouter) notePromiseBreak(mid string, p peer.ID) {
 			delete(pk.promised, mid)
 		}
 	}
-	pk.breaks[p]++
-	if pk.breaks[p] >= pk.k {
-		pk.parked[p] = time.Now().Add(pk.ttl)
+	now := time.Now()
+	b := pk.breaks[p]
+	b.n++
+	b.last = now
+	pk.breaks[p] = b
+	if b.n >= pk.k {
+		pk.parked[p] = now.Add(pk.ttl)
 	}
 }
 
 // peerParked reports whether a peer's announcements are currently ineligible for pull
-// selection. Expired parks clear lazily.
+// selection. An expired park met here clears at once rather than waiting for the sweep.
 func (gs *GossipSubRouter) peerParked(p peer.ID) bool {
 	pk := gs.park
 	if pk == nil {
@@ -190,8 +206,36 @@ func (gs *GossipSubRouter) peerParked(p peer.ID) bool {
 		return false
 	}
 	if time.Now().After(until) {
-		delete(pk.parked, p)
+		pk.unpark(p)
 		return false
 	}
 	return true
+}
+
+// unpark lifts a park and forgets the breaks that caused it, so the peer starts clean: a park
+// whose breaks survived it would re-park the peer on its first break forever after.
+func (pk *commitmentPark) unpark(p peer.ID) {
+	delete(pk.parked, p)
+	delete(pk.breaks, p)
+}
+
+// sweepPark lifts expired parks and forgets breaks older than ttl; called from the heartbeat.
+// Parks are otherwise only checked when the peer announces, and breaks below k were never
+// checked at all.
+func (gs *GossipSubRouter) sweepPark() {
+	pk := gs.park
+	if pk == nil {
+		return
+	}
+	now := time.Now()
+	for p, until := range pk.parked {
+		if now.After(until) {
+			pk.unpark(p)
+		}
+	}
+	for p, b := range pk.breaks {
+		if now.Sub(b.last) >= pk.ttl {
+			delete(pk.breaks, p)
+		}
+	}
 }

@@ -35,7 +35,7 @@ func newRefusalRouter(t *testing.T, full, open peer.ID) (*GossipSubRouter, *rpcQ
 		iwantWindow: time.Minute,
 		park: &commitmentPark{k: 1, ttl: time.Hour, promise: time.Second,
 			promised: make(map[string]map[peer.ID]time.Time),
-			breaks:   make(map[peer.ID]int),
+			breaks:   make(map[peer.ID]breakRecord),
 			parked:   make(map[peer.ID]time.Time),
 		},
 		offers: &offerTable{

@@ -78,7 +78,7 @@ func TestOfferTable(t *testing.T) {
 		gs := newOfferRouter()
 		gs.park = &commitmentPark{k: 1, ttl: time.Hour, promise: time.Second,
 			promised: make(map[string]map[peer.ID]time.Time),
-			breaks:   make(map[peer.ID]int),
+			breaks:   make(map[peer.ID]breakRecord),
 			parked:   map[peer.ID]time.Time{a: time.Now().Add(time.Hour)},
 		}
 		gs.recordOffer("m", "t", a)
@@ -167,7 +167,7 @@ func TestOfferTable(t *testing.T) {
 		gs := newOfferRouter()
 		gs.park = &commitmentPark{k: 1, ttl: time.Hour, promise: time.Second,
 			promised: make(map[string]map[peer.ID]time.Time),
-			breaks:   make(map[peer.ID]int),
+			breaks:   make(map[peer.ID]breakRecord),
 			parked:   make(map[peer.ID]time.Time),
 		}
 		gs.recordOffer("m", "t", a)
