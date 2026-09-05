@@ -27,6 +27,14 @@ type gossipTracer struct {
 	peerPromises map[peer.ID]map[string]struct{}
 }
 
+// promiseTrace identifies the promise, if any, added by one AddPromise call.
+// AddPromise samples one ID and preserves a promise that already exists, so
+// rollback must distinguish a new promise from an older one for the same peer.
+type promiseTrace struct {
+	mid   string
+	added bool
+}
+
 func newGossipTracer() *gossipTracer {
 	return &gossipTracer{
 		idGen:        newMsgIdGenerator(),
@@ -45,9 +53,9 @@ func (gt *gossipTracer) Start(gs *GossipSubRouter) {
 }
 
 // track a promise to deliver a message from a list of msgIDs we are requesting
-func (gt *gossipTracer) AddPromise(p peer.ID, msgIDs []string) {
+func (gt *gossipTracer) AddPromise(p peer.ID, msgIDs []string) promiseTrace {
 	if gt == nil {
-		return
+		return promiseTrace{}
 	}
 
 	idx := rand.Intn(len(msgIDs))
@@ -62,44 +70,44 @@ func (gt *gossipTracer) AddPromise(p peer.ID, msgIDs []string) {
 		gt.promises[mid] = promises
 	}
 
-	_, ok = promises[p]
-	if !ok {
-		promises[p] = time.Now().Add(gt.followUpTime)
-		peerPromises, ok := gt.peerPromises[p]
-		if !ok {
-			peerPromises = make(map[string]struct{})
-			gt.peerPromises[p] = peerPromises
-		}
-		peerPromises[mid] = struct{}{}
+	if _, ok = promises[p]; ok {
+		return promiseTrace{}
 	}
+
+	promises[p] = time.Now().Add(gt.followUpTime)
+	peerPromises, ok := gt.peerPromises[p]
+	if !ok {
+		peerPromises = make(map[string]struct{})
+		gt.peerPromises[p] = peerPromises
+	}
+	peerPromises[mid] = struct{}{}
+	return promiseTrace{mid: mid, added: true}
 }
 
-// dropPromise forgets promises to p for msgIDs. It exists for requests that were never
-// transmitted: sendRPC can refuse an RPC at queue admission, and a promise recorded for an
-// IWANT that never left this node would score the peer for failing to answer a question it
-// was never asked.
-func (gt *gossipTracer) dropPromise(p peer.ID, msgIDs []string) {
-	if gt == nil {
+// dropPromise forgets the promise added by one AddPromise call. It exists for requests that
+// were never transmitted: sendRPC can refuse an RPC at queue admission, and a promise
+// recorded for an IWANT that never left this node would score the peer for failing to answer
+// a question it was never asked.
+func (gt *gossipTracer) dropPromise(p peer.ID, traced promiseTrace) {
+	if gt == nil || !traced.added {
 		return
 	}
 
 	gt.Lock()
 	defer gt.Unlock()
 
-	for _, mid := range msgIDs {
-		promises, ok := gt.promises[mid]
-		if !ok {
-			continue
-		}
-		delete(promises, p)
-		if len(promises) == 0 {
-			delete(gt.promises, mid)
-		}
-		if peerPromises, ok := gt.peerPromises[p]; ok {
-			delete(peerPromises, mid)
-			if len(peerPromises) == 0 {
-				delete(gt.peerPromises, p)
-			}
+	promises, ok := gt.promises[traced.mid]
+	if !ok {
+		return
+	}
+	delete(promises, p)
+	if len(promises) == 0 {
+		delete(gt.promises, traced.mid)
+	}
+	if peerPromises, ok := gt.peerPromises[p]; ok {
+		delete(peerPromises, traced.mid)
+		if len(peerPromises) == 0 {
+			delete(gt.peerPromises, p)
 		}
 	}
 }

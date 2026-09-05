@@ -140,7 +140,7 @@ func TestOfferTable(t *testing.T) {
 		topic := "t"
 		mids := []string{"m1", "m2"}
 
-		if got := gs.handleIHave(a, &pb.ControlMessage{Ihave: []*pb.ControlIHave{{
+		if got, _ := gs.handleIHave(a, &pb.ControlMessage{Ihave: []*pb.ControlIHave{{
 			TopicID: &topic, MessageIDs: mids,
 		}}}); len(got) != 0 {
 			t.Fatalf("capped IHAVE produced %d IWANTs", len(got))

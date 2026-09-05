@@ -111,7 +111,7 @@ func (gs *GossipSubRouter) noteDelivered(mid string) {
 // down for one window so the next selection rotates past it, and the offer table's record of
 // the attempt stays, because selection prefers untried announcers and forgetting the attempt
 // would make the peer whose queue is full the most attractive candidate again.
-func (gs *GossipSubRouter) undoIWantDispatch(p peer.ID, mids []string) {
+func (gs *GossipSubRouter) undoIWantDispatch(p peer.ID, mids []string, traced promiseTrace) {
 	if len(mids) == 0 {
 		return
 	}
@@ -120,7 +120,7 @@ func (gs *GossipSubRouter) undoIWantDispatch(p peer.ID, mids []string) {
 	} else {
 		delete(gs.iasked, p)
 	}
-	gs.gossipTracer.dropPromise(p, mids)
+	gs.gossipTracer.dropPromise(p, traced)
 	gs.gateFailed(p, mids)
 	for _, mid := range mids {
 		if pk := gs.park; pk != nil {

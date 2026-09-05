@@ -141,6 +141,43 @@ func TestRefusedIWantBlamesNobody(t *testing.T) {
 	}
 }
 
+func TestRefusedIWantPreservesEarlierTracerPromise(t *testing.T) {
+	full, open := peer.ID("full"), peer.ID("open")
+	gs, _ := newRefusalRouter(t, full, open)
+	gs.park.k = 2
+	gs.gossipTracer = newGossipTracer()
+	gs.gossipTracer.followUpTime = time.Hour
+	fq := gs.p.peers[full]
+	popNext(t, fq) // make room for the first ask
+	gs.recordOffer("m", "t", full)
+
+	gs.retryOfferedPull("m")
+	popNext(t, fq) // the first ask was transmitted
+	if _, promised := gs.gossipTracer.promises["m"][full]; !promised {
+		t.Fatal("the first transmitted ask left no tracer promise")
+	}
+
+	// The first commitment breaks, but k=2 leaves the peer eligible for another ask
+	// while the tracer still scores the earlier one.
+	firstAsked := gs.park.promised["m"][full]
+	gs.promiseDue("m", full, firstAsked)
+	if gs.peerParked(full) {
+		t.Fatal("one break parked a peer at k=2")
+	}
+	if err := fq.Push(&RPC{}, false); err != nil {
+		t.Fatal(err)
+	}
+
+	gs.retryOfferedPull("m")
+
+	if _, promised := gs.gossipTracer.promises["m"][full]; !promised {
+		t.Fatal("the refused second ask erased the first ask's tracer promise")
+	}
+	if _, promised := gs.gossipTracer.peerPromises[full]["m"]; !promised {
+		t.Fatal("the refused second ask erased the first ask's peer index")
+	}
+}
+
 // TestDisconnectedAnnouncerIsSkipped: an announcer that left has no queue, so it is not a
 // candidate; nothing is charged and nothing is sent.
 func TestDisconnectedAnnouncerIsSkipped(t *testing.T) {

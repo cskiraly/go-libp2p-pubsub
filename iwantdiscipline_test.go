@@ -104,7 +104,7 @@ func TestIWantDisciplineAskCap(t *testing.T) {
 	}
 
 	// A dispatch refused at admission refunds the ask, and only for the disciplined id.
-	gs.undoIWantDispatch(a, []string{"m0", "free"})
+	gs.undoIWantDispatch(a, []string{"m0", "free"}, promiseTrace{})
 	if gs.iwantGranted[a] != disciplinedAsksPerHeartbeat-1 {
 		t.Fatalf("granted = %d after one refund, want %d", gs.iwantGranted[a], disciplinedAsksPerHeartbeat-1)
 	}

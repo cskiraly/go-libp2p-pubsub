@@ -934,7 +934,7 @@ func (gs *GossipSubRouter) HandleRPC(rpc *RPC) {
 		return
 	}
 
-	iwant := gs.handleIHave(rpc.from, ctl)
+	iwant, traced := gs.handleIHave(rpc.from, ctl)
 	iWantResponses := gs.handleIWant(rpc.from, ctl)
 	prune := gs.handleGraft(rpc.from, ctl)
 	gs.handlePrune(rpc.from, ctl)
@@ -959,7 +959,7 @@ func (gs *GossipSubRouter) HandleRPC(rpc *RPC) {
 			asked = append(asked, iw.GetMessageIDs()...)
 		}
 		if !gs.sendRPC(rpc.from, rpcWithControl(nil, nil, iwant, nil, nil, nil), true) {
-			gs.undoIWantDispatch(rpc.from, asked)
+			gs.undoIWantDispatch(rpc.from, asked, traced)
 		}
 	}
 
@@ -969,23 +969,23 @@ func (gs *GossipSubRouter) HandleRPC(rpc *RPC) {
 	}
 }
 
-func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.ControlIWant {
+func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb.ControlIWant, promiseTrace) {
 	// we ignore IHAVE gossip from any peer whose score is below the gossip threshold
 	score := gs.score.Score(p)
 	if score < gs.gossipThreshold {
 		gs.logger.Debug("IHAVE: ignoring peer with score below threshold", "peer", p, "score", score)
-		return nil
+		return nil, promiseTrace{}
 	}
 
 	// IHAVE flood protection
 	gs.peerhave[p]++
 	if gs.peerhave[p] > gs.params.MaxIHaveMessages {
 		gs.logger.Debug("IHAVE: peer has advertised too many times within this heartbeat interval; ignoring", "peer", p, "count", gs.peerhave[p])
-		return nil
+		return nil, promiseTrace{}
 	}
 	if gs.iasked[p] >= gs.params.MaxIHaveLength {
 		gs.logger.Debug("IHAVE: peer has already advertised too many messages; ignoring", "peer", p, "messageCount", gs.iasked[p])
-		return nil
+		return nil, promiseTrace{}
 	}
 
 	// iwant is the dedup set; an id announced under several topics keeps the first.
@@ -1029,7 +1029,7 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 	}
 
 	if len(candidates) == 0 {
-		return nil
+		return nil, promiseTrace{}
 	}
 
 	// Decide the per-peer allowance before consulting any request policy. The policies record
@@ -1040,24 +1040,24 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 	// ids we ask for by ordering its IHAVE -- while making selection and dispatch the same set.
 	allowance := gs.params.MaxIHaveLength - gs.iasked[p]
 	if allowance <= 0 {
-		return nil
+		return nil, promiseTrace{}
 	}
 	shuffleStrings(candidates)
 
 	iwantlst := gs.selectIWants(candidates, iwant, p, allowance)
 	if len(iwantlst) == 0 {
-		return nil
+		return nil, promiseTrace{}
 	}
 
 	gs.logger.Debug("IHAVE: Asking for messages from peer", "asking", len(iwantlst), "candidates", len(candidates), "peer", p)
 	gs.iasked[p] += len(iwantlst)
 
-	gs.gossipTracer.AddPromise(p, iwantlst)
+	traced := gs.gossipTracer.AddPromise(p, iwantlst)
 	// Only the dispatched set is reported, so an application budget is charged for requests
 	// that were actually made rather than for ids a later policy refused.
 	gs.gateCommitted(p, iwantlst)
 
-	return []*pb.ControlIWant{{MessageIDs: iwantlst}}
+	return []*pb.ControlIWant{{MessageIDs: iwantlst}}, traced
 }
 
 // selectIWants picks at most allowance ids from candidates, consulting the active request
