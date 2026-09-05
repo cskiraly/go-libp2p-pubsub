@@ -22,6 +22,7 @@ type offerTable struct {
 	tried  map[string]map[peer.ID]time.Time // asks already spent per id
 	topic  map[string]string                // id -> topic it was announced under
 	byPeer map[peer.ID]int                  // offers recorded per peer, for the per-peer cap
+	armed  map[string]struct{}              // ids with a retry timer in flight; one at a time
 }
 
 // Per-peer and per-id bounds on the offer table. A peer beyond its budget stops being
@@ -49,6 +50,7 @@ func WithOfferTable() Option {
 			tried:  make(map[string]map[peer.ID]time.Time),
 			topic:  make(map[string]string),
 			byPeer: make(map[peer.ID]int),
+			armed:  make(map[string]struct{}),
 		}
 		return nil
 	}
@@ -91,12 +93,31 @@ func (gs *GossipSubRouter) noteOfferTried(mid string, p peer.ID) {
 		ot.tried[mid] = make(map[peer.ID]time.Time)
 	}
 	ot.tried[mid][p] = time.Now()
+	gs.armOfferRetry(mid)
+}
+
+// armOfferRetry schedules the retry check for mid one window out, unless one is already in
+// flight: an id owns at most one retry timer, however many asks or skips it goes through, so
+// the chain cannot multiply. It reports whether a timer was armed.
+func (gs *GossipSubRouter) armOfferRetry(mid string) bool {
+	ot := gs.offers
+	if ot == nil {
+		return false
+	}
+	if _, inFlight := ot.armed[mid]; inFlight {
+		return false
+	}
+	ot.armed[mid] = struct{}{}
 	time.AfterFunc(gs.iwantWindow+5*time.Millisecond, func() {
 		select {
-		case gs.p.eval <- func() { gs.retryOfferedPull(mid) }:
+		case gs.p.eval <- func() {
+			delete(ot.armed, mid)
+			gs.retryOfferedPull(mid)
+		}:
 		case <-gs.p.ctx.Done():
 		}
 	})
+	return true
 }
 
 // clearOffers forgets a delivered id.
@@ -137,16 +158,23 @@ func (gs *GossipSubRouter) sweepOffers() {
 }
 
 // pickOfferedPeer chooses the announcer to re-ask for mid: untried first, then least recently
-// tried, in deterministic peer order. Parked and gate-declined announcers are skipped.
-func (gs *GossipSubRouter) pickOfferedPeer(mid string) (peer.ID, bool) {
+// tried, in deterministic peer order. Parked and gate-declined announcers are skipped, and so
+// is any announcer whose earlier ask for this id is still unjudged; waiting reports whether at
+// least one announcer was skipped for that reason, since that state resolves on its own clock
+// (delivery or the promise deadline) and is worth coming back for.
+func (gs *GossipSubRouter) pickOfferedPeer(mid string) (pick peer.ID, found, waiting bool) {
 	ot := gs.offers
 	offers := ot.offers[mid]
 	if len(offers) == 0 {
-		return "", false
+		return "", false, false
 	}
 	cands := make([]peer.ID, 0, len(offers))
 	for p := range offers {
 		if gs.peerParked(p) {
+			continue
+		}
+		if gs.promiseOpen(mid, p) {
+			waiting = true
 			continue
 		}
 		if !gs.gateAllows(p, ot.topic[mid], mid) {
@@ -155,22 +183,21 @@ func (gs *GossipSubRouter) pickOfferedPeer(mid string) (peer.ID, bool) {
 		cands = append(cands, p)
 	}
 	if len(cands) == 0 {
-		return "", false
+		return "", false, waiting
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
 	tried := ot.tried[mid]
-	pick, found := peer.ID(""), false
 	var oldest time.Time
 	for _, p := range cands {
 		t, was := tried[p]
 		if !was {
-			return p, true
+			return p, true, waiting
 		}
 		if !found || t.Before(oldest) {
 			pick, found, oldest = p, true, t
 		}
 	}
-	return pick, found
+	return pick, found, waiting
 }
 
 // retryOfferedPull runs on the router goroutine one window after an ask was granted. If the
@@ -186,8 +213,17 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) {
 	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
 		return // an ask is in flight; its own retry timer will fire
 	}
-	pick, found := gs.pickOfferedPeer(mid)
-	if !found || !gs.iwantAllowed(mid, gs.offers.topic[mid], pick) {
+	pick, found, waiting := gs.pickOfferedPeer(mid)
+	if !found {
+		if waiting {
+			// The only announcers left are still being judged. Come back once, rather
+			// than waiting for an event that may never come: a broken promise parks the
+			// peer and delivery clears the id, and either way the next check settles it.
+			gs.armOfferRetry(mid)
+		}
+		return
+	}
+	if !gs.iwantAllowed(mid, gs.offers.topic[mid], pick) {
 		return
 	}
 	gs.iasked[pick]++

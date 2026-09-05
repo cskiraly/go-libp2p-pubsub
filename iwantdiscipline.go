@@ -42,11 +42,19 @@ func (gs *GossipSubRouter) disciplined(topic string) bool {
 
 // iwantAllowed reports whether an IWANT for mid, announced on topic, may be issued to from
 // now, recording it if so. Runs on pubsub's goroutine, like every router map.
+//
+// A peer whose earlier ask for this id is still unjudged is refused even after the window has
+// moved on: the move-on exists to try someone else, and a repeat to the same peer could only
+// duplicate a response already on its way or re-stamp a promise the withholder is about to
+// break. With one announcer left the receiver waits for that judgment instead.
 func (gs *GossipSubRouter) iwantAllowed(mid, topic string, from peer.ID) bool {
 	if !gs.disciplined(topic) {
 		return true
 	}
 	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
+		return false
+	}
+	if gs.promiseOpen(mid, from) {
 		return false
 	}
 	gs.iwantAsked[mid] = time.Now()

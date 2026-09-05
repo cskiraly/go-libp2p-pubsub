@@ -22,6 +22,7 @@ func newOfferRouter() *GossipSubRouter {
 			tried:  make(map[string]map[peer.ID]time.Time),
 			topic:  make(map[string]string),
 			byPeer: make(map[peer.ID]int),
+			armed:  make(map[string]struct{}),
 		},
 	}
 }
@@ -34,11 +35,11 @@ func TestOfferTable(t *testing.T) {
 		gs.recordOffer("m", "t", b)
 		gs.recordOffer("m", "t", a)
 		gs.recordOffer("m", "t", c)
-		if p, ok := gs.pickOfferedPeer("m"); !ok || p != a {
+		if p, ok, _ := gs.pickOfferedPeer("m"); !ok || p != a {
 			t.Fatalf("picked %q, want the first untried announcer %q", p, a)
 		}
 		gs.offers.tried["m"] = map[peer.ID]time.Time{a: time.Now()}
-		if p, ok := gs.pickOfferedPeer("m"); !ok || p != b {
+		if p, ok, _ := gs.pickOfferedPeer("m"); !ok || p != b {
 			t.Fatalf("picked %q, want the next untried announcer %q", p, b)
 		}
 	})
@@ -49,7 +50,7 @@ func TestOfferTable(t *testing.T) {
 		gs.recordOffer("m", "t", b)
 		now := time.Now()
 		gs.offers.tried["m"] = map[peer.ID]time.Time{a: now, b: now.Add(-time.Second)}
-		if p, ok := gs.pickOfferedPeer("m"); !ok || p != b {
+		if p, ok, _ := gs.pickOfferedPeer("m"); !ok || p != b {
 			t.Fatalf("picked %q, want the least recently tried %q", p, b)
 		}
 	})
@@ -63,7 +64,7 @@ func TestOfferTable(t *testing.T) {
 		}
 		gs.recordOffer("m", "t", a)
 		gs.recordOffer("m", "t", b)
-		if p, ok := gs.pickOfferedPeer("m"); !ok || p != b {
+		if p, ok, _ := gs.pickOfferedPeer("m"); !ok || p != b {
 			t.Fatalf("picked %q, want the unparked announcer %q", p, b)
 		}
 	})
@@ -82,7 +83,7 @@ func TestOfferTable(t *testing.T) {
 		if gs.offers.byPeer[a] != 1 {
 			t.Fatalf("byPeer = %d after delivery, want 1", gs.offers.byPeer[a])
 		}
-		if _, ok := gs.pickOfferedPeer("m"); ok {
+		if _, ok, _ := gs.pickOfferedPeer("m"); ok {
 			t.Fatal("a delivered id still has a pick")
 		}
 	})
@@ -119,6 +120,46 @@ func TestOfferTable(t *testing.T) {
 		}
 	})
 
+	t.Run("an announcer with an open promise is skipped and waited for", func(t *testing.T) {
+		gs := newOfferRouter()
+		gs.park = &commitmentPark{k: 1, ttl: time.Hour, promise: time.Second,
+			promised: make(map[string]map[peer.ID]time.Time),
+			breaks:   make(map[peer.ID]int),
+			parked:   make(map[peer.ID]time.Time),
+		}
+		gs.recordOffer("m", "t", a)
+		gs.recordOffer("m", "t", b)
+		if !gs.iwantAllowed("m", "t", a) {
+			t.Fatal("the first ask was refused")
+		}
+		if p, ok, _ := gs.pickOfferedPeer("m"); !ok || p != b {
+			t.Fatalf("picked %q, want %q: the peer with the open promise must be skipped", p, b)
+		}
+		delete(gs.offers.offers["m"], b)
+		if _, ok, waiting := gs.pickOfferedPeer("m"); ok || !waiting {
+			t.Fatal("a sole announcer with an open promise must yield no pick and waiting=true")
+		}
+		// Judgment closes the promise: the announcer is parked and no longer waited for.
+		gs.promiseDue("m", a, gs.park.promised["m"][a])
+		if _, ok, waiting := gs.pickOfferedPeer("m"); ok || waiting {
+			t.Fatal("a parked announcer must be neither picked nor waited for")
+		}
+	})
+
+	t.Run("an id owns one retry timer at a time", func(t *testing.T) {
+		gs := newOfferRouter()
+		gs.recordOffer("m", "t", a)
+		if !gs.armOfferRetry("m") {
+			t.Fatal("the first arm was refused")
+		}
+		if gs.armOfferRetry("m") {
+			t.Fatal("a second timer was armed while one was in flight")
+		}
+		if !gs.armOfferRetry("m2") {
+			t.Fatal("another id was refused its own timer")
+		}
+	})
+
 	t.Run("a repeated offer refreshes without double counting", func(t *testing.T) {
 		gs := newOfferRouter()
 		gs.recordOffer("m", "t", a)
@@ -148,7 +189,7 @@ func TestOfferTable(t *testing.T) {
 		if _, was := gs.offers.tried["m"][a]; !was {
 			t.Fatal("the granted ask was not recorded as tried")
 		}
-		if p, ok := gs.pickOfferedPeer("m"); !ok || p != b {
+		if p, ok, _ := gs.pickOfferedPeer("m"); !ok || p != b {
 			t.Fatalf("picked %q for the retry, want the untried %q", p, b)
 		}
 	})

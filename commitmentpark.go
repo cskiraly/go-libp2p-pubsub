@@ -56,8 +56,21 @@ func WithIHaveCommitmentPark(k int, promise, ttl time.Duration) Option {
 	}
 }
 
+// promiseOpen reports whether p has an unserved, unjudged ask for mid. Such a peer is never
+// asked again for that id: a second ask could not be judged separately, and refreshing the
+// first would let a peer that is re-asked every window escape judgment altogether.
+func (gs *GossipSubRouter) promiseOpen(mid string, p peer.ID) bool {
+	pk := gs.park
+	if pk == nil {
+		return false
+	}
+	_, open := pk.promised[mid][p]
+	return open
+}
+
 // notePromise opens a promise for an ask just granted and schedules its judgment on the
-// router goroutine.
+// router goroutine. An open promise is never overwritten: its deadline belongs to the first
+// ask, and the timer captured that timestamp.
 func (gs *GossipSubRouter) notePromise(mid string, from peer.ID, askedAt time.Time) {
 	pk := gs.park
 	if pk == nil {
@@ -65,6 +78,9 @@ func (gs *GossipSubRouter) notePromise(mid string, from peer.ID, askedAt time.Ti
 	}
 	if pk.promised[mid] == nil {
 		pk.promised[mid] = make(map[peer.ID]time.Time)
+	}
+	if _, open := pk.promised[mid][from]; open {
+		return
 	}
 	pk.promised[mid][from] = askedAt
 	time.AfterFunc(pk.promise, func() {
