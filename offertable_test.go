@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p-pubsub/timecache"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -119,6 +120,63 @@ func TestOfferTable(t *testing.T) {
 		}
 		if len(gs.offers.tried) != 0 || len(gs.offers.armed) != 0 || len(gs.offers.retries) != 0 {
 			t.Fatal("an untracked id got a tried record or a retry check")
+		}
+		gs.iwantGranted[a] = disciplinedAsksPerHeartbeat
+		if gs.iwantAllowed("capped", "t", a) {
+			t.Fatal("an untracked ask beyond the cap was allowed")
+		}
+		if len(gs.offers.armed) != 0 || len(gs.offers.retries) != 0 {
+			t.Fatal("a capped untracked id got a retry check")
+		}
+	})
+
+	t.Run("capped IHAVE ids retry after the heartbeat", func(t *testing.T) {
+		gs := newOfferRouter()
+		gs.params = DefaultGossipSubParams()
+		gs.p.peerFilter = DefaultPeerFilter
+		gs.mesh = map[string]map[peer.ID]struct{}{"t": {a: {}}}
+		gs.peerhave = make(map[peer.ID]int)
+		gs.iwantGranted = map[peer.ID]int{a: disciplinedAsksPerHeartbeat}
+		topic := "t"
+		mids := []string{"m1", "m2"}
+
+		if got := gs.handleIHave(a, &pb.ControlMessage{Ihave: []*pb.ControlIHave{{
+			TopicID: &topic, MessageIDs: mids,
+		}}}); len(got) != 0 {
+			t.Fatalf("capped IHAVE produced %d IWANTs", len(got))
+		}
+		for _, mid := range mids {
+			if _, tracked := gs.offers.offers[mid]; !tracked {
+				t.Fatalf("capped id %q was not tracked", mid)
+			}
+			if _, armed := gs.offers.armed[mid]; !armed {
+				t.Fatalf("capped id %q has no retry queued", mid)
+			}
+		}
+
+		gs.clearIWantAsked()
+		fireOfferRetries(gs)
+		for _, mid := range mids {
+			if _, asked := gs.iwantAsked[mid]; !asked {
+				t.Fatalf("id %q was not asked after the heartbeat reset", mid)
+			}
+		}
+	})
+
+	t.Run("a capped retry rearms", func(t *testing.T) {
+		gs := newOfferRouter()
+		gs.recordOffer("m", "t", a)
+		gs.iwantGranted = map[peer.ID]int{a: disciplinedAsksPerHeartbeat}
+		gs.armOfferRetry("m")
+
+		fireOfferRetries(gs)
+
+		if _, armed := gs.offers.armed["m"]; !armed || len(gs.offers.retries) != 1 {
+			t.Fatalf("capped retry left armed=%v with %d checks, want one re-armed check",
+				armed, len(gs.offers.retries))
+		}
+		if _, asked := gs.iwantAsked["m"]; asked {
+			t.Fatal("capped retry recorded an ask")
 		}
 	})
 

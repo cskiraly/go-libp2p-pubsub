@@ -70,6 +70,14 @@ func (gs *GossipSubRouter) iwantAllowed(mid, topic string, from peer.ID) bool {
 		return false
 	}
 	if gs.iwantGranted[from] >= disciplinedAsksPerHeartbeat {
+		// A tracked offer must not lose its only path back to selection merely
+		// because this heartbeat has spent the peer's ask budget. Window and
+		// open-promise refusals already have their own outstanding clocks.
+		if gs.offers != nil {
+			if _, tracked := gs.offers.offers[mid]; tracked {
+				gs.armOfferRetry(mid)
+			}
+		}
 		return false
 	}
 	if gs.iwantGranted == nil {
