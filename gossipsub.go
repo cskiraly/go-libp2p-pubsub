@@ -606,6 +606,7 @@ type GossipSubRouter struct {
 	iwantMatch   func(topic string) bool          // topics the discipline applies to; nil = all
 	iwantAsked   map[string]time.Time             // message ids with an IWANT in flight, by request time
 	iwantRefused map[peer.ID]time.Time            // peers whose last IWANT was refused at queue admission, cooling down
+	iwantGranted map[peer.ID]int                  // disciplined asks granted per peer in the last heartbeat
 	park         *commitmentPark                  // optional: IHAVE is a binding offer; unserved asks park the announcer
 	offers       *offerTable                      // optional: remembered announcers, re-asked when the discipline moves on
 	requestGate  RequestGate                      // optional application veto on requesting an announced id

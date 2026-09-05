@@ -15,6 +15,15 @@ import (
 // discipline allows one outstanding IWANT per id within a window; on expiry the next IHAVE may
 // re-request, so a lost reply costs one window rather than liveness.
 
+// disciplinedAsksPerHeartbeat caps the asks granted to one peer per heartbeat on disciplined
+// topics. Stock bounds a peer's asks per heartbeat by MaxIHaveLength (5000), sized for ids
+// that cost a lookup each; here every granted ask also opens a promise and a retry check, and
+// a withholder is judged only at its deadline, so one announcer could open thousands of them
+// per heartbeat before its first break parks it. Honest announcers on a segmented payload
+// path offer a few dozen ids per payload (a 1 MiB payload in 32 KiB segments is 32); 512
+// leaves an order of magnitude above that and takes one off the attacker.
+const disciplinedAsksPerHeartbeat = 512
+
 // WithIWantDiscipline enables one-outstanding-IWANT-per-id with the given expiry window on
 // every topic the matcher accepts; a nil matcher covers every topic. The window must cover a
 // round trip plus the peer's transmission of what was asked -- the same sizing rule as any
@@ -47,6 +56,9 @@ func (gs *GossipSubRouter) disciplined(topic string) bool {
 // moved on: the move-on exists to try someone else, and a repeat to the same peer could only
 // duplicate a response already on its way or re-stamp a promise the withholder is about to
 // break. With one announcer left the receiver waits for that judgment instead.
+//
+// A peer at its per-heartbeat ask cap is refused too; the id stays unasked and open to the
+// next announcer, or to this one after the heartbeat.
 func (gs *GossipSubRouter) iwantAllowed(mid, topic string, from peer.ID) bool {
 	if !gs.disciplined(topic) {
 		return true
@@ -57,6 +69,13 @@ func (gs *GossipSubRouter) iwantAllowed(mid, topic string, from peer.ID) bool {
 	if gs.promiseOpen(mid, from) {
 		return false
 	}
+	if gs.iwantGranted[from] >= disciplinedAsksPerHeartbeat {
+		return false
+	}
+	if gs.iwantGranted == nil {
+		gs.iwantGranted = make(map[peer.ID]int)
+	}
+	gs.iwantGranted[from]++
 	gs.iwantAsked[mid] = time.Now()
 	gs.notePromise(mid, from, gs.iwantAsked[mid])
 	gs.noteOfferTried(mid, from)
@@ -104,8 +123,15 @@ func (gs *GossipSubRouter) undoIWantDispatch(p peer.ID, mids []string) {
 				}
 			}
 		}
-		if gs.iwantAsked != nil {
+		// Only a disciplined id has a window record, and only that ask counted against the
+		// peer's cap.
+		if _, asked := gs.iwantAsked[mid]; asked {
 			delete(gs.iwantAsked, mid)
+			if gs.iwantGranted[p] > 1 {
+				gs.iwantGranted[p]--
+			} else {
+				delete(gs.iwantGranted, p)
+			}
 		}
 	}
 	if gs.iwantAsked != nil {
@@ -123,12 +149,16 @@ func (gs *GossipSubRouter) sendRefusedRecently(p peer.ID) bool {
 	return ok && time.Since(at) < gs.iwantWindow
 }
 
-// clearIWantAsked drops expired outstanding-request records and lapsed cooldowns; called from
-// the heartbeat. Delivery deliberately does not clear a request record: a delivered id is
-// seen, so no later IHAVE can re-request it, and the entry ages out here.
+// clearIWantAsked drops expired outstanding-request records and lapsed cooldowns and resets the
+// per-peer ask counts; called from the heartbeat. Delivery deliberately does not clear a
+// request record: a delivered id is seen, so no later IHAVE can re-request it, and the entry
+// ages out here.
 func (gs *GossipSubRouter) clearIWantAsked() {
 	if gs.iwantAsked == nil {
 		return
+	}
+	if len(gs.iwantGranted) > 0 {
+		gs.iwantGranted = make(map[peer.ID]int)
 	}
 	for mid, at := range gs.iwantAsked {
 		if time.Since(at) >= gs.iwantWindow {

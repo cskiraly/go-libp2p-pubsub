@@ -75,6 +75,52 @@ func TestIWantDisciplineScopedToTopics(t *testing.T) {
 	}
 }
 
+// TestIWantDisciplineAskCap: a peer's disciplined asks are capped per heartbeat; other peers
+// and undisciplined topics are unaffected, a refused dispatch refunds the count, and the
+// heartbeat resets it.
+func TestIWantDisciplineAskCap(t *testing.T) {
+	gs := &GossipSubRouter{
+		iwantAsked:  make(map[string]time.Time),
+		iwantWindow: time.Minute,
+		iwantMatch:  func(topic string) bool { return topic == "t" },
+	}
+	a, b := peer.ID("a"), peer.ID("b")
+	for i := range disciplinedAsksPerHeartbeat {
+		if !gs.iwantAllowed(fmt.Sprintf("m%d", i), "t", a) {
+			t.Fatalf("ask %d was refused below the cap", i)
+		}
+	}
+	if gs.iwantAllowed("over", "t", a) {
+		t.Fatal("an ask beyond the cap was allowed")
+	}
+	if !gs.iwantAllowed("over", "t", b) {
+		t.Fatal("another peer's ask was refused by a's cap")
+	}
+	if !gs.iwantAllowed("free", "blocks", a) {
+		t.Fatal("an undisciplined topic was capped")
+	}
+	if gs.iwantGranted[a] != disciplinedAsksPerHeartbeat {
+		t.Fatalf("granted = %d, want exactly the cap", gs.iwantGranted[a])
+	}
+
+	// A dispatch refused at admission refunds the ask, and only for the disciplined id.
+	gs.undoIWantDispatch(a, []string{"m0", "free"})
+	if gs.iwantGranted[a] != disciplinedAsksPerHeartbeat-1 {
+		t.Fatalf("granted = %d after one refund, want %d", gs.iwantGranted[a], disciplinedAsksPerHeartbeat-1)
+	}
+	if !gs.iwantAllowed("m0", "t", a) {
+		t.Fatal("the refund did not reopen the cap")
+	}
+
+	gs.clearIWantAsked()
+	if len(gs.iwantGranted) != 0 {
+		t.Fatal("the heartbeat did not reset the ask counts")
+	}
+	if !gs.iwantAllowed("next", "t", a) {
+		t.Fatal("the cap did not reopen with the heartbeat")
+	}
+}
+
 // TestSelectIWantsRecordsOnlyDispatched pins the select/commit seam.
 //
 // The discipline records state as a side effect of allowing an id, so selecting freely and
