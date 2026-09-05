@@ -109,11 +109,10 @@ func TestRefusedIWantBlamesNobody(t *testing.T) {
 		t.Fatal("no retry was re-armed after the refusal")
 	}
 
-	// Another announcer appears: it is chosen, the refused one is skipped, and the request goes
-	// out and is charged normally.
+	// Another announcer appears; when the re-armed check comes due it is chosen, the refused
+	// one is skipped, and the request goes out and is charged normally.
 	gs.recordOffer("m", "t", open)
-	delete(gs.offers.armed, "m")
-	gs.retryOfferedPull("m")
+	fireOfferRetries(gs)
 	if _, open := gs.park.promised["m"][open]; !open {
 		t.Fatal("the request to the open peer left no promise")
 	}

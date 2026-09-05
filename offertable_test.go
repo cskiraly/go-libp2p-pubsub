@@ -3,6 +3,7 @@ package pubsub
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -19,9 +20,12 @@ func newOfferRouter() *GossipSubRouter {
 		peers[peer.ID(p)] = newRpcQueue(8)
 	}
 	return &GossipSubRouter{
-		p:           &PubSub{ctx: ctx, eval: make(chan func()), peers: peers, seenMessages: timecache.NewTimeCache(time.Minute)},
+		p: &PubSub{ctx: ctx, eval: make(chan func()), peers: peers, seenMessages: timecache.NewTimeCache(time.Minute),
+			maxMessageSize: DefaultMaxMessageSize, maxControlMessageSize: DefaultMaxMessageSize},
+		logger:      slog.Default(),
 		iwantAsked:  make(map[string]time.Time),
 		iwantWindow: time.Minute,
+		iasked:      make(map[peer.ID]int),
 		offers: &offerTable{
 			offers: make(map[string]map[peer.ID]time.Time),
 			tried:  make(map[string]map[peer.ID]time.Time),
@@ -30,6 +34,16 @@ func newOfferRouter() *GossipSubRouter {
 			armed:  make(map[string]struct{}),
 		},
 	}
+}
+
+// fireOfferRetries runs every queued retry check now, the way the queue's timer would on the
+// router goroutine once each check came due.
+func fireOfferRetries(gs *GossipSubRouter) {
+	past := time.Now().Add(-time.Second)
+	for i := range gs.offers.retries {
+		gs.offers.retries[i].due = past
+	}
+	gs.sweepOfferRetries()
 }
 
 func TestOfferTable(t *testing.T) {
@@ -162,6 +176,36 @@ func TestOfferTable(t *testing.T) {
 		}
 		if !gs.armOfferRetry("m2") {
 			t.Fatal("another id was refused its own timer")
+		}
+	})
+
+	t.Run("retry checks run from one queue with one timer", func(t *testing.T) {
+		gs := newOfferRouter()
+		gs.recordOffer("m", "t", a)
+		gs.recordOffer("m2", "t", b)
+		gs.armOfferRetry("m")
+		gs.armOfferRetry("m2")
+		if n := len(gs.offers.retries); n != 2 || !gs.offers.timer {
+			t.Fatalf("%d checks queued (timer armed: %v), want 2 with one timer", n, gs.offers.timer)
+		}
+		// Nothing is due yet: a pass judges nothing and keeps the timer.
+		gs.sweepOfferRetries()
+		if len(gs.offers.retries) != 2 || !gs.offers.timer {
+			t.Fatal("an early pass dropped queued checks or the timer")
+		}
+		// Both come due: each id is re-asked from its announcer, and each granted ask queues
+		// the id's next check, so the queue stays armed for those.
+		fireOfferRetries(gs)
+		if len(gs.iwantAsked) != 2 {
+			t.Fatalf("%d asks after the pass, want 2", len(gs.iwantAsked))
+		}
+		if n := len(gs.offers.retries); n != 2 || !gs.offers.timer {
+			t.Fatalf("%d successor checks queued (timer armed: %v), want 2 with the timer re-armed", n, gs.offers.timer)
+		}
+		for _, r := range gs.offers.retries {
+			if !r.due.After(time.Now()) {
+				t.Fatal("a successor check is due in the past")
+			}
 		}
 	})
 

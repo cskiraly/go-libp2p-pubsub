@@ -22,7 +22,20 @@ type offerTable struct {
 	tried  map[string]map[peer.ID]time.Time // asks already spent per id
 	topic  map[string]string                // id -> topic it was announced under
 	byPeer map[peer.ID]int                  // offers recorded per peer, for the per-peer cap
-	armed  map[string]struct{}              // ids with a retry timer in flight; one at a time
+	armed  map[string]struct{}              // ids with a retry check queued; one at a time
+
+	// retries is the retry-check queue in due order, with one timer armed for its head. Every
+	// check is due one window after it is armed, so arm order is due order and a FIFO serves;
+	// with a per-peer window the due time would depend on the peer asked, and this would
+	// have to become a min-heap on the due time.
+	retries []offerRetry
+	timer   bool // a timer for the head of retries is in flight
+}
+
+// offerRetry is one queued retry check.
+type offerRetry struct {
+	mid string
+	due time.Time
 }
 
 // Per-peer and per-id bounds on the offer table. A peer beyond its budget stops being
@@ -96,9 +109,9 @@ func (gs *GossipSubRouter) noteOfferTried(mid string, p peer.ID) {
 	gs.armOfferRetry(mid)
 }
 
-// armOfferRetry schedules the retry check for mid one window out, unless one is already in
-// flight: an id owns at most one retry timer, however many asks or skips it goes through, so
-// the chain cannot multiply. It reports whether a timer was armed.
+// armOfferRetry queues the retry check for mid one window out, unless one is already queued:
+// an id owns at most one retry check, however many asks or skips it goes through, so the
+// chain cannot multiply. It reports whether a check was queued.
 func (gs *GossipSubRouter) armOfferRetry(mid string) bool {
 	ot := gs.offers
 	if ot == nil {
@@ -108,16 +121,49 @@ func (gs *GossipSubRouter) armOfferRetry(mid string) bool {
 		return false
 	}
 	ot.armed[mid] = struct{}{}
-	time.AfterFunc(gs.iwantWindow+5*time.Millisecond, func() {
+	ot.retries = append(ot.retries, offerRetry{mid: mid, due: time.Now().Add(gs.iwantWindow + 5*time.Millisecond)})
+	gs.armOfferSweep()
+	return true
+}
+
+// armOfferSweep schedules one pass over the retry queue for its head unless a pass is already
+// in flight; the pass runs on the router goroutine and re-arms for the next head, so there is
+// one timer however many checks are queued.
+func (gs *GossipSubRouter) armOfferSweep() {
+	ot := gs.offers
+	if ot.timer || len(ot.retries) == 0 {
+		return
+	}
+	ot.timer = true
+	time.AfterFunc(time.Until(ot.retries[0].due), func() {
 		select {
-		case gs.p.eval <- func() {
-			delete(ot.armed, mid)
-			gs.retryOfferedPull(mid)
-		}:
+		case gs.p.eval <- gs.sweepOfferRetries:
 		case <-gs.p.ctx.Done():
 		}
 	})
-	return true
+}
+
+// sweepOfferRetries runs every retry check that is due, in order, then re-arms for the next
+// one. A check may queue its own successor; that entry is due a window from now, so the pass
+// stops at it. Runs on the router goroutine.
+func (gs *GossipSubRouter) sweepOfferRetries() {
+	ot := gs.offers
+	if ot == nil {
+		return
+	}
+	now := time.Now()
+	for len(ot.retries) > 0 && !ot.retries[0].due.After(now) {
+		r := ot.retries[0]
+		ot.retries[0] = offerRetry{}
+		ot.retries = ot.retries[1:]
+		delete(ot.armed, r.mid)
+		gs.retryOfferedPull(r.mid)
+	}
+	if len(ot.retries) == 0 {
+		ot.retries = nil
+	}
+	ot.timer = false
+	gs.armOfferSweep()
 }
 
 // clearOffers forgets a delivered id.
@@ -215,7 +261,7 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) {
 		return
 	}
 	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
-		return // an ask is in flight; its own retry timer will fire
+		return // an ask is in flight; its own retry check is queued
 	}
 	pick, found, waiting := gs.pickOfferedPeer(mid)
 	if !found {
