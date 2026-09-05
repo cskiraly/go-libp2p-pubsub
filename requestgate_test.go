@@ -152,6 +152,30 @@ func TestRequestDeferralBounds(t *testing.T) {
 	}
 }
 
+// TestRequestDeferralSweep: the heartbeat drops expired and delivered entries while the gate
+// stays closed, without waiting for the application to replay.
+func TestRequestDeferralSweep(t *testing.T) {
+	gs := newGateRouter(func(string, string) bool { return false })
+	gs.params = DefaultGossipSubParams()
+	gs.p.deliveredMessages = timecache.NewTimeCache(time.Minute)
+	for _, mid := range []string{"m1", "m2", "m3"} {
+		gs.noteDeclined(peer.ID("p"), "t", mid)
+	}
+	gs.deferred["m2"].at = time.Now().Add(-time.Hour)
+	gs.p.deliveredMessages.Add("m3")
+
+	gs.sweepDeferred()
+	if _, ok := gs.deferred["m2"]; ok {
+		t.Fatal("an expired entry survived the sweep")
+	}
+	if _, ok := gs.deferred["m3"]; ok {
+		t.Fatal("a delivered entry survived the sweep")
+	}
+	if _, ok := gs.deferred["m1"]; !ok {
+		t.Fatal("a live entry was swept")
+	}
+}
+
 // TestRequestDeferralReplay pins the replay: once the gate opens, a deferred id is requested
 // from a connected announcer through the ordinary selection path, and delivered or expired
 // entries are dropped instead.

@@ -169,6 +169,26 @@ func (gs *GossipSubRouter) noteDeclined(p peer.ID, topic, mid string) {
 	e.peers = append(e.peers, p)
 }
 
+// sweepDeferred drops deferred announcements that expired or arrived; called from the heartbeat
+// and ahead of every replay. The ledger used to shrink only on replay, so while the
+// application kept the gate closed every declined id stayed until the cap, and the cap is
+// what an attacker fills.
+//
+// "Arrived" means delivered, not seen: a message is marked seen before application validation,
+// so an id the application declined and did not retain is seen while having reached nobody.
+// deliveredMessages is the distinction the library keeps.
+func (gs *GossipSubRouter) sweepDeferred() {
+	if gs.deferred == nil {
+		return
+	}
+	ttl := time.Duration(gs.params.HistoryLength) * gs.params.HeartbeatInterval
+	for mid, e := range gs.deferred {
+		if time.Since(e.at) >= ttl || gs.p.deliveredMessages.Has(mid) {
+			delete(gs.deferred, mid)
+		}
+	}
+}
+
 // replayDeferred re-offers deferred ids to the gate and requests those now permitted. Runs on
 // the router's loop.
 //
@@ -182,18 +202,10 @@ func (gs *GossipSubRouter) replayDeferred() {
 	if gs.deferred == nil || gs.requestGate == nil {
 		return
 	}
-	ttl := time.Duration(gs.params.HistoryLength) * gs.params.HeartbeatInterval
+	gs.sweepDeferred()
 	announcersOf := make(map[string][]peer.ID, len(gs.deferred))
 	topicOf := make(map[string]string, len(gs.deferred))
 	for mid, e := range gs.deferred {
-		// Expired, or it arrived while we waited: either way stop tracking it. "Arrived"
-		// means delivered, not seen: a message is marked seen before application
-		// validation, so an id the application declined and did not retain is seen while
-		// having reached nobody. deliveredMessages is the distinction the library keeps.
-		if time.Since(e.at) >= ttl || gs.p.deliveredMessages.Has(mid) {
-			delete(gs.deferred, mid)
-			continue
-		}
 		topicOf[mid] = e.topic
 		for _, pid := range e.peers {
 			if _, connected := gs.p.peers[pid]; !connected {
