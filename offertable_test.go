@@ -105,6 +105,30 @@ func TestOfferTable(t *testing.T) {
 		if _, ok, _ := gs.pickOfferedPeer("m"); ok {
 			t.Fatal("a delivered id still has a pick")
 		}
+		gs.noteDelivered("m2")
+		if _, kept := gs.offers.byPeer[a]; kept {
+			t.Fatal("a peer with no offers left keeps a zero counter")
+		}
+	})
+
+	t.Run("an ask for an untracked id leaves no record and no retry", func(t *testing.T) {
+		gs := newOfferRouter()
+		// No recordOffer: the offer was refused (budget, cap) or never made.
+		if !gs.iwantAllowed("m", "t", a) {
+			t.Fatal("the ask was refused")
+		}
+		if len(gs.offers.tried) != 0 || len(gs.offers.armed) != 0 || len(gs.offers.retries) != 0 {
+			t.Fatal("an untracked id got a tried record or a retry check")
+		}
+	})
+
+	t.Run("the sweep drops tried records whose id is no longer tracked", func(t *testing.T) {
+		gs := newOfferRouter()
+		gs.offers.tried["orphan"] = map[peer.ID]time.Time{a: time.Now()}
+		gs.sweepOffers()
+		if _, kept := gs.offers.tried["orphan"]; kept {
+			t.Fatal("an orphaned tried record survived the sweep")
+		}
 	})
 
 	t.Run("a peer beyond its budget is not recorded", func(t *testing.T) {
@@ -223,8 +247,11 @@ func TestOfferTable(t *testing.T) {
 		gs.recordOffer("m", "t", a)
 		gs.offers.offers["m"][a] = time.Now().Add(-offerTTL - time.Second)
 		gs.sweepOffers()
-		if len(gs.offers.offers) != 0 || gs.offers.byPeer[a] != 0 {
+		if len(gs.offers.offers) != 0 {
 			t.Fatal("an expired offer survived the sweep")
+		}
+		if _, kept := gs.offers.byPeer[a]; kept {
+			t.Fatal("the swept peer keeps a zero counter")
 		}
 	})
 

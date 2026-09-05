@@ -95,11 +95,16 @@ func (gs *GossipSubRouter) recordOffer(mid, topic string, p peer.ID) {
 	peers[p] = time.Now()
 }
 
-// noteOfferTried records an ask granted to p for mid and schedules the retry check one window
-// later, on the router goroutine.
+// noteOfferTried records an ask granted to p for mid and queues the retry check one window
+// later. Only a tracked id gets a record: when recordOffer refused the offer (budget, cap,
+// expiry) there is nobody to re-ask, and a tried entry with no offers behind it would outlive
+// the id, since only clearOffers removes it.
 func (gs *GossipSubRouter) noteOfferTried(mid string, p peer.ID) {
 	ot := gs.offers
 	if ot == nil {
+		return
+	}
+	if _, tracked := ot.offers[mid]; !tracked {
 		return
 	}
 	if ot.tried[mid] == nil {
@@ -173,16 +178,26 @@ func (gs *GossipSubRouter) clearOffers(mid string) {
 		return
 	}
 	for p := range ot.offers[mid] {
-		if ot.byPeer[p] > 0 {
-			ot.byPeer[p]--
-		}
+		ot.refundOffer(p)
 	}
 	delete(ot.offers, mid)
 	delete(ot.tried, mid)
 	delete(ot.topic, mid)
 }
 
-// sweepOffers ages out stale offers; called from the heartbeat.
+// refundOffer returns one offer to p's budget, dropping the counter at zero so peers that came
+// and went do not stay in the map.
+func (ot *offerTable) refundOffer(p peer.ID) {
+	if ot.byPeer[p] > 1 {
+		ot.byPeer[p]--
+		return
+	}
+	delete(ot.byPeer, p)
+}
+
+// sweepOffers ages out stale offers; called from the heartbeat. It also drops tried records
+// whose id is no longer tracked, so the invariant that tried follows offers holds even if
+// an id leaves the table by a path that forgot to clear it.
 func (gs *GossipSubRouter) sweepOffers() {
 	ot := gs.offers
 	if ot == nil {
@@ -192,13 +207,16 @@ func (gs *GossipSubRouter) sweepOffers() {
 		for p, at := range peers {
 			if time.Since(at) >= offerTTL {
 				delete(peers, p)
-				if ot.byPeer[p] > 0 {
-					ot.byPeer[p]--
-				}
+				ot.refundOffer(p)
 			}
 		}
 		if len(peers) == 0 {
 			gs.clearOffers(mid)
+		}
+	}
+	for mid := range ot.tried {
+		if _, tracked := ot.offers[mid]; !tracked {
+			delete(ot.tried, mid)
 		}
 	}
 }
