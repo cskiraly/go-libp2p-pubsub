@@ -71,6 +71,21 @@ func TestCommitmentPark(t *testing.T) {
 		}
 	})
 
+	t.Run("a stale break does not count toward k", func(t *testing.T) {
+		gs := newParkRouter(2, time.Second, time.Minute)
+		gs.park.breaks[a] = breakRecord{n: 1, last: time.Now().Add(-time.Minute)}
+
+		at := gs.askForTest("m", a)
+		gs.promiseDue("m", a, at)
+
+		if gs.peerParked(a) {
+			t.Fatal("a fresh break was combined with a stale break at k=2")
+		}
+		if got := gs.park.breaks[a].n; got != 1 {
+			t.Fatalf("breaks = %d after stale reset, want 1", got)
+		}
+	})
+
 	t.Run("delivery keeps the promise", func(t *testing.T) {
 		gs := newParkRouter(1, time.Second, time.Hour)
 		at := gs.askForTest("m", a)

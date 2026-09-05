@@ -186,6 +186,9 @@ func (gs *GossipSubRouter) notePromiseBreak(mid string, p peer.ID) {
 	}
 	now := time.Now()
 	b := pk.breaks[p]
+	if now.Sub(b.last) >= pk.ttl {
+		b = breakRecord{}
+	}
 	b.n++
 	b.last = now
 	pk.breaks[p] = b
