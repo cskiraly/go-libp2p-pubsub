@@ -993,19 +993,21 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb
 	candidates := make([]string, 0, 32)
 	for _, ihave := range ctl.GetIhave() {
 		topic := ihave.GetTopicID()
-		_, ok := gs.mesh[topic]
-		if !ok {
-			continue
-		}
-
-		if !gs.p.peerFilter(p, topic) {
-			continue
-		}
-
-		// Commitment enforcement: a parked peer's announcements on a disciplined topic are
-		// ineligible for pull selection until its park expires.
-		if gs.disciplined(topic) && gs.peerParked(p) {
-			continue
+		eligible := true
+		if gs.iwantAsked == nil && gs.requestGate == nil {
+			// Keep stock's checks and their order when no pull policy is installed.
+			if _, joined := gs.mesh[topic]; !joined {
+				continue
+			}
+			if !gs.p.peerFilter(p, topic) {
+				continue
+			}
+		} else {
+			eligibility := gs.iwantPeerEligibility(p, topic)
+			if eligibility == iwantIneligible {
+				continue
+			}
+			eligible = eligibility == iwantEligible
 		}
 
 	checkIwantMsgsLoop:
@@ -1020,6 +1022,10 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb
 				continue
 			}
 			gs.recordOffer(mid, topic, p)
+			// An otherwise eligible announcement is still an offer during refusal cooldown.
+			if !eligible {
+				continue
+			}
 			if _, dup := iwant[mid]; dup {
 				continue
 			}

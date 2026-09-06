@@ -128,6 +128,29 @@ func TestIWantDisciplineAskCap(t *testing.T) {
 	}
 }
 
+func TestIWantDisciplinePeerEligibilityIsReadOnly(t *testing.T) {
+	gs := newOfferRouter()
+	p := peer.ID("announcer-a")
+	gs.park = newParkRouter(1, time.Second, time.Hour).park
+	expired := time.Now().Add(-time.Second)
+	gs.park.parked[p] = expired
+	gs.park.breaks[p] = breakRecord{n: 1, last: expired.Add(-time.Hour)}
+	if gs.iwantPeerEligibility(p, "t") != iwantEligible || gs.iwantPeerEligibility(p, "t") != iwantEligible {
+		t.Fatal("an expired park still blocks selection")
+	}
+	if !gs.park.parked[p].Equal(expired) || gs.park.breaks[p].n != 1 {
+		t.Fatal("eligibility mutated the park ledger")
+	}
+	if len(gs.iwantAsked) != 0 || len(gs.park.promised) != 0 || len(gs.iwantGranted) != 0 {
+		t.Fatal("eligibility recorded request state")
+	}
+	gs.park.parked[p] = time.Now().Add(time.Hour)
+	gs.iwantMatch = func(topic string) bool { return topic == "segments" }
+	if gs.iwantPeerEligibility(p, "t") != iwantEligible {
+		t.Fatal("a park blocks an undisciplined topic")
+	}
+}
+
 // TestSelectIWantsRecordsOnlyDispatched pins the select/commit seam.
 //
 // The discipline records state as a side effect of allowing an id, so selecting freely and

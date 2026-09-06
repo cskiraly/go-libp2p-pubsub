@@ -27,8 +27,10 @@ func newRefusalRouter(t *testing.T, full, open peer.ID) (*GossipSubRouter, *rpcQ
 			deliveredMessages:     timecache.NewTimeCache(time.Minute),
 			maxMessageSize:        DefaultMaxMessageSize,
 			maxControlMessageSize: DefaultMaxMessageSize,
+			peerFilter:            DefaultPeerFilter,
 		},
 		params:      DefaultGossipSubParams(),
+		mesh:        map[string]map[peer.ID]struct{}{"t": {}},
 		logger:      slog.Default(),
 		iasked:      make(map[peer.ID]int),
 		iwantAsked:  make(map[string]time.Time),
@@ -296,5 +298,80 @@ func TestReplayDeferredKeepsRefusedEntries(t *testing.T) {
 	}
 	if _, asked := gs.iwantAsked["m1"]; asked {
 		t.Fatal("the refused replay left the discipline window closed")
+	}
+}
+
+func TestRetryAndReplayPeerEligibility(t *testing.T) {
+	first, second := peer.ID("full"), peer.ID("open")
+	for _, path := range []string{"retry", "replay"} {
+		t.Run(path, func(t *testing.T) {
+			for _, tc := range []struct {
+				name  string
+				setup func(*GossipSubRouter)
+				want  peer.ID
+			}{
+				{"non-mesh announcer on a joined topic", func(*GossipSubRouter) {}, first},
+				{"score below gossip threshold", func(gs *GossipSubRouter) {
+					gs.gossipThreshold = -1
+					gs.score = newPeerScore(&PeerScoreParams{
+						AppSpecificScore:  func(peer.ID) float64 { return -2 },
+						AppSpecificWeight: 1,
+					}, gs.logger)
+					gs.score.peerStats[first] = &peerStats{}
+				}, second},
+				{"no IWANT allowance", func(gs *GossipSubRouter) {
+					gs.iasked[first] = gs.params.MaxIHaveLength
+				}, second},
+				{"no longer joined", func(gs *GossipSubRouter) {
+					delete(gs.mesh, "t")
+				}, ""},
+				{"peer filter declines", func(gs *GossipSubRouter) {
+					gs.p.peerFilter = func(p peer.ID, _ string) bool { return p != first }
+				}, second},
+				{"parked announcer", func(gs *GossipSubRouter) {
+					gs.park.parked[first] = time.Now().Add(time.Hour)
+				}, second},
+				{"refusal cooldown", func(gs *GossipSubRouter) {
+					gs.iwantRefused = map[peer.ID]time.Time{first: time.Now()}
+				}, second},
+				{"disconnected announcer", func(gs *GossipSubRouter) {
+					delete(gs.p.peers, first)
+				}, second},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					gs, sq := newRefusalRouter(t, first, second)
+					fq := gs.p.peers[first]
+					popNext(t, fq) // both peers can accept; eligibility must choose between them
+					gs.recordOffer("m", "t", first)
+					gs.recordOffer("m", "t", second)
+					gs.requestGate = &recordingGate{allow: func(string, string) bool { return true }}
+					gs.deferred = map[string]*deferredEntry{"m": {topic: "t", peers: []peer.ID{first, second}, at: time.Now()}}
+					tc.setup(gs)
+					if path == "retry" {
+						gs.retryOfferedPull("m")
+					} else {
+						gs.replayDeferred()
+					}
+					for p, q := range map[peer.ID]*rpcQueue{first: fq, second: sq} {
+						if p != tc.want {
+							if q.queue.Len() != 0 || gs.promiseOpen("m", p) || gs.iwantGranted[p] != 0 {
+								t.Fatalf("unselected peer %q received an ask or a charge", p)
+							}
+							continue
+						}
+						if !gs.promiseOpen("m", p) || gs.iwantGranted[p] != 1 {
+							t.Fatalf("eligible peer %q was not asked", p)
+						}
+						rpc := popNext(t, q)
+						if iw := rpc.GetControl().GetIwant(); len(iw) != 1 || len(iw[0].MessageIDs) != 1 || iw[0].MessageIDs[0] != "m" {
+							t.Fatalf("queued %v, want one IWANT for m", rpc)
+						}
+					}
+					if tc.want == "" && path == "replay" && gs.deferred["m"] == nil {
+						t.Fatal("replay lost an entry with no eligible announcers")
+					}
+				})
+			}
+		})
 	}
 }

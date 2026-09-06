@@ -33,7 +33,8 @@ func newGateRouter(allow func(topic, mid string) bool) *GossipSubRouter {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	return &GossipSubRouter{
-		p:           &PubSub{ctx: ctx, eval: make(chan func())},
+		p:           &PubSub{ctx: ctx, eval: make(chan func()), peerFilter: DefaultPeerFilter},
+		mesh:        map[string]map[peer.ID]struct{}{"t": {}},
 		iwantAsked:  make(map[string]time.Time),
 		iwantWindow: time.Minute,
 		requestGate: &recordingGate{allow: allow},
@@ -261,5 +262,30 @@ func TestRequestDeferralReplayOpensLater(t *testing.T) {
 	}
 	if n := len(rpc.Control.GetIwant()); n != 1 || len(rpc.Control.GetIwant()[0].GetMessageIDs()) != 2 {
 		t.Fatalf("queued RPC carries %d IWANT entries, want one with both ids", n)
+	}
+}
+
+func TestRequestDeferralRetryDecline(t *testing.T) {
+	full, open := peer.ID("full"), peer.ID("open")
+	gs, q := newRefusalRouter(t, full, open)
+	allowed := false
+	gs.requestGate = &recordingGate{allow: func(string, string) bool { return allowed }}
+	gs.deferred = make(map[string]*deferredEntry)
+	gs.deferredMax = 8
+	gs.recordOffer("m", "t", open)
+	gs.retryOfferedPull("m")
+	if e := gs.deferred["m"]; e == nil || e.topic != "t" || len(e.peers) != 1 || e.peers[0] != open {
+		t.Fatalf("gate-declined retry left deferral %v, want m on t from open", e)
+	}
+	if gs.promiseOpen("m", open) || len(gs.iwantAsked) != 0 || gs.iasked[open] != 0 {
+		t.Fatal("a gate-declined retry recorded request state")
+	}
+	allowed = true
+	gs.replayDeferred()
+	if gs.deferred["m"] != nil || !gs.promiseOpen("m", open) {
+		t.Fatal("the deferred retry was not requested when the gate opened")
+	}
+	if got := popNext(t, q).GetControl().GetIwant(); len(got) != 1 || len(got[0].MessageIDs) != 1 || got[0].MessageIDs[0] != "m" {
+		t.Fatalf("replay queued %v, want an IWANT for m", got)
 	}
 }

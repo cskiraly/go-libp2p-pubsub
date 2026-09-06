@@ -103,6 +103,53 @@ func TestIHaveReplyIWantWinsLastQueueSlot(t *testing.T) {
 	}
 }
 
+func TestIHaveReplyStockEligibilityOrder(t *testing.T) {
+	full, open := peer.ID("full"), peer.ID("open")
+	for _, tc := range []struct {
+		name        string
+		setup       func(*GossipSubRouter)
+		filter      bool
+		filterCalls int
+		wantAsk     bool
+	}{
+		{"score before IHAVE count", func(gs *GossipSubRouter) { gs.gossipThreshold = 1 }, true, 0, false},
+		{"IHAVE count before filter", func(gs *GossipSubRouter) { gs.peerhave[open] = gs.params.MaxIHaveMessages }, true, 0, false},
+		{"allowance before filter", func(gs *GossipSubRouter) { gs.iasked[open] = gs.params.MaxIHaveLength }, true, 0, false},
+		{"joined before filter", func(gs *GossipSubRouter) { delete(gs.mesh, "t") }, true, 0, false},
+		{"filter declines", func(*GossipSubRouter) {}, false, 1, false},
+		{"non-mesh announcer accepted", func(*GossipSubRouter) {}, true, 1, true},
+		{"no new connectedness check", func(gs *GossipSubRouter) { delete(gs.p.peers, open) }, true, 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gs, _ := newRefusalRouter(t, full, open)
+			gs.iwantAsked, gs.offers, gs.park = nil, nil, nil
+			gs.peerhave = make(map[peer.ID]int)
+			calls := 0
+			gs.p.peerFilter = func(p peer.ID, topic string) bool {
+				calls++
+				if gs.peerhave[p] != 1 || topic != "t" {
+					t.Fatal("filter called before the IHAVE count or for an unexpected topic")
+				}
+				return tc.filter
+			}
+			tc.setup(gs)
+			before := gs.peerhave[open]
+			topic := "t"
+			got, attempts, _ := gs.handleIHave(open, &pb.ControlMessage{Ihave: []*pb.ControlIHave{{TopicID: &topic, MessageIDs: []string{"m"}}}})
+			if (len(got) == 1) != tc.wantAsk || calls != tc.filterCalls {
+				t.Fatalf("got %d asks and %d filter calls, want ask=%v and %d calls", len(got), calls, tc.wantAsk, tc.filterCalls)
+			}
+			wantHave := before + 1
+			if gs.gossipThreshold > 0 {
+				wantHave = before
+			}
+			if gs.peerhave[open] != wantHave || len(attempts) != 0 {
+				t.Fatal("stock IHAVE accounting changed or recorded discipline state")
+			}
+		})
+	}
+}
+
 func TestSendRPCReportsNormalSendPiggyback(t *testing.T) {
 	full, open := peer.ID("full"), peer.ID("open")
 	gs, oq := newRefusalRouter(t, full, open)

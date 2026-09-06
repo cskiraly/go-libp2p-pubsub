@@ -225,8 +225,8 @@ func (gs *GossipSubRouter) sweepOffers() {
 }
 
 // pickOfferedPeer chooses the announcer to re-ask for mid: untried first, then least recently
-// tried, in deterministic peer order. Disconnected, parked, cooling-down and gate-declined
-// announcers are skipped, and so is any announcer whose earlier ask for this id is still
+// tried, in deterministic peer order. Ineligible and gate-declined announcers are skipped,
+// and so is any announcer whose earlier ask for this id is still
 // unjudged; waiting reports whether at
 // least one announcer was skipped for that reason, since that state resolves on its own clock
 // (delivery or the promise deadline) and is worth coming back for.
@@ -238,10 +238,7 @@ func (gs *GossipSubRouter) pickOfferedPeer(mid string) (pick peer.ID, found, wai
 	}
 	cands := make([]peer.ID, 0, len(offers))
 	for p := range offers {
-		if _, connected := gs.p.peers[p]; !connected {
-			continue // the announcer left; nothing to send to
-		}
-		if gs.peerParked(p) || gs.sendRefusedRecently(p) {
+		if gs.iwantPeerEligibility(p, ot.topic[mid]) != iwantEligible {
 			continue
 		}
 		if gs.promiseOpen(mid, p) {
@@ -249,6 +246,7 @@ func (gs *GossipSubRouter) pickOfferedPeer(mid string) (pick peer.ID, found, wai
 			continue
 		}
 		if !gs.gateAllows(p, ot.topic[mid], mid) {
+			gs.noteDeclined(p, ot.topic[mid], mid)
 			continue
 		}
 		cands = append(cands, p)

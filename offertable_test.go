@@ -22,7 +22,9 @@ func newOfferRouter() *GossipSubRouter {
 	}
 	return &GossipSubRouter{
 		p: &PubSub{ctx: ctx, eval: make(chan func()), peers: peers, seenMessages: timecache.NewTimeCache(time.Minute),
-			maxMessageSize: DefaultMaxMessageSize, maxControlMessageSize: DefaultMaxMessageSize},
+			maxMessageSize: DefaultMaxMessageSize, maxControlMessageSize: DefaultMaxMessageSize, peerFilter: DefaultPeerFilter},
+		params:      DefaultGossipSubParams(),
+		mesh:        map[string]map[peer.ID]struct{}{"t": {}},
 		logger:      slog.Default(),
 		iwantAsked:  make(map[string]time.Time),
 		iwantWindow: time.Minute,
@@ -159,6 +161,49 @@ func TestOfferTable(t *testing.T) {
 		for _, mid := range mids {
 			if _, asked := gs.iwantAsked[mid]; !asked {
 				t.Fatalf("id %q was not asked after the heartbeat reset", mid)
+			}
+		}
+	})
+
+	t.Run("fresh IHAVE during cooldown is retained without an ask", func(t *testing.T) {
+		gs := newOfferRouter()
+		gs.peerhave = make(map[peer.ID]int)
+		gs.iwantRefused = map[peer.ID]time.Time{a: time.Now()}
+		topic := "t"
+		ctl := &pb.ControlMessage{Ihave: []*pb.ControlIHave{{TopicID: &topic, MessageIDs: []string{"m"}}}}
+		if got, _, _ := gs.handleIHave(a, ctl); len(got) != 0 {
+			t.Fatal("a cooling-down peer was asked")
+		}
+		if _, kept := gs.offers.offers["m"][a]; !kept {
+			t.Fatal("the cooling-down peer's offer was lost")
+		}
+		if len(gs.iwantAsked) != 0 || gs.iasked[a] != 0 || gs.iwantGranted[a] != 0 {
+			t.Fatal("a cooling-down peer was charged for an ask")
+		}
+		gs.iwantRefused[a] = time.Now().Add(-gs.iwantWindow)
+		if got, _, _ := gs.handleIHave(a, ctl); len(got) != 1 {
+			t.Fatal("the announcer remained ineligible after cooldown expired")
+		}
+	})
+
+	t.Run("cooldown does not retain offers rejected by topic eligibility", func(t *testing.T) {
+		gs := newOfferRouter()
+		gs.peerhave = make(map[peer.ID]int)
+		gs.iwantRefused = map[peer.ID]time.Time{a: time.Now()}
+		for _, topic := range []string{"unjoined", "filtered", "parked"} {
+			if topic != "unjoined" {
+				gs.mesh[topic] = map[peer.ID]struct{}{}
+			}
+			gs.p.peerFilter = func(_ peer.ID, topic string) bool { return topic != "filtered" }
+			if topic == "parked" {
+				gs.park = newParkRouter(1, time.Second, time.Hour).park
+				gs.park.parked[a] = time.Now().Add(time.Hour)
+			}
+			if got, _, _ := gs.handleIHave(a, &pb.ControlMessage{Ihave: []*pb.ControlIHave{{TopicID: &topic, MessageIDs: []string{"m"}}}}); len(got) != 0 {
+				t.Fatalf("an ineligible announcement on %q produced an ask", topic)
+			}
+			if len(gs.offers.offers) != 0 {
+				t.Fatalf("an ineligible announcement on %q was retained", topic)
 			}
 		}
 	})

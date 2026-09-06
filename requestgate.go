@@ -208,7 +208,7 @@ func (gs *GossipSubRouter) replayDeferred() {
 	for mid, e := range gs.deferred {
 		topicOf[mid] = e.topic
 		for _, pid := range e.peers {
-			if _, connected := gs.p.peers[pid]; !connected {
+			if gs.iwantPeerEligibility(pid, e.topic) != iwantEligible {
 				continue
 			}
 			announcersOf[mid] = append(announcersOf[mid], pid)

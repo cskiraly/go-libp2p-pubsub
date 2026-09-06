@@ -49,6 +49,45 @@ func (gs *GossipSubRouter) disciplined(topic string) bool {
 	return gs.iwantAsked != nil && (gs.iwantMatch == nil || gs.iwantMatch(topic))
 }
 
+type iwantEligibility uint8
+
+const (
+	iwantIneligible iwantEligibility = iota
+	iwantEligible
+	iwantCoolingDown
+)
+
+// iwantPeerEligibility checks current peer and topic eligibility before ranking or assigning
+// pulls. It does not charge request state or expire parks; the heartbeat owns that cleanup.
+// The per-RPC IHAVE flood check and per-id request policies remain at their respective sites.
+// Cooldown is reported separately so otherwise eligible fresh offers can still be retained.
+func (gs *GossipSubRouter) iwantPeerEligibility(p peer.ID, topic string) iwantEligibility {
+	if _, connected := gs.p.peers[p]; !connected {
+		return iwantIneligible
+	}
+	if gs.score.Score(p) < gs.gossipThreshold {
+		return iwantIneligible
+	}
+	if _, joined := gs.mesh[topic]; !joined {
+		return iwantIneligible
+	}
+	if !gs.p.peerFilter(p, topic) {
+		return iwantIneligible
+	}
+	if gs.disciplined(topic) && gs.park != nil {
+		if until, parked := gs.park.parked[p]; parked && !time.Now().After(until) {
+			return iwantIneligible
+		}
+	}
+	if gs.iasked[p] >= gs.params.MaxIHaveLength {
+		return iwantIneligible
+	}
+	if gs.sendRefusedRecently(p) {
+		return iwantCoolingDown
+	}
+	return iwantEligible
+}
+
 // iwantAttempt identifies the refundable discipline state created by one allowed ask.
 // An undisciplined ask returns a zero token and owns no window, promise or cap charge.
 type iwantAttempt struct {
