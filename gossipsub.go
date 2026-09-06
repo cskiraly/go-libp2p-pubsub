@@ -1714,19 +1714,26 @@ func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC, urgent bool) bool {
 		return gs.doSendRPC(out, p, q, urgent)
 	}
 
-	// Potentially split the RPC into multiple RPCs that are below the max message size.
-	// Admitted only if every fragment was: a partially delivered request is not a request.
-	admitted := true
-	for rpc := range out.split(gs.p.maxMessageSize, gs.p.maxControlMessageSize) {
-		if dropIfOversized(rpc) {
-			admitted = false
-			continue
-		}
-		if !gs.doSendRPC(rpc, p, q, urgent) {
-			admitted = false
+	// Preflight every fragment before admitting any: callers undo the entire request on
+	// refusal. The router is the only producer, and the writer can only free queue space,
+	// so enough capacity here guarantees admission of all fragments below.
+	fragments := slices.Collect(out.split(gs.p.maxMessageSize, gs.p.maxControlMessageSize))
+	for _, rpc := range fragments {
+		if rpc.exceedsSizeLimits(gs.p.maxMessageSize, gs.p.maxControlMessageSize) {
+			gs.doDropRPC(out, p, "split RPC contains an oversized fragment")
+			return false
 		}
 	}
-	return admitted
+	if q.freeCapacity() < len(fragments) {
+		gs.doDropRPC(out, p, "queue has insufficient space for split RPC")
+		return false
+	}
+	for _, rpc := range fragments {
+		if !gs.doSendRPC(rpc, p, q, urgent) {
+			return false
+		}
+	}
+	return true
 }
 
 func (gs *GossipSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {

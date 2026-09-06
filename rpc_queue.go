@@ -72,6 +72,13 @@ func (q *rpcQueue) UrgentPush(rpc *RPC, block bool) error {
 	return q.push(rpc, true, block)
 }
 
+// freeCapacity reports the remaining capacity shared by the normal and urgent lanes.
+func (q *rpcQueue) freeCapacity() int {
+	q.queueMu.Lock()
+	defer q.queueMu.Unlock()
+	return q.maxSize - q.queue.Len()
+}
+
 func (q *rpcQueue) push(rpc *RPC, urgent bool, block bool) error {
 	q.queueMu.Lock()
 	defer q.queueMu.Unlock()

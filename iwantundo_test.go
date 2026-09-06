@@ -2,7 +2,10 @@ package pubsub
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,6 +74,88 @@ func TestSendRPCReportsAdmission(t *testing.T) {
 	if gs.sendRPC(peer.ID("gone"), iwant, false) {
 		t.Fatal("a send to a peer without a queue was reported as admitted")
 	}
+}
+
+func TestSendRPCSplitAdmission(t *testing.T) {
+	full, open := peer.ID("full"), peer.ID("open")
+	// Each 40-byte id fits in a control frame; two do not. This IWANT needs three slots.
+	mids := []string{strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40)}
+	for _, urgent := range []bool{false, true} {
+		for _, free := range []int{2, 3} {
+			t.Run(fmt.Sprintf("urgent=%v/free=%d", urgent, free), func(t *testing.T) {
+				gs, _ := newRefusalRouter(t, full, open)
+				gs.p.maxMessageSize, gs.p.maxControlMessageSize = 64, 48
+				q := newRpcQueue(free + 2)
+				gs.p.peers[open] = q
+				normal, priority := &RPC{}, &RPC{}
+				if err := q.Push(normal, false); err != nil {
+					t.Fatal(err)
+				}
+				if err := q.UrgentPush(priority, false); err != nil {
+					t.Fatal(err)
+				}
+				out := rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: mids}}, nil, nil, nil)
+				admitted := gs.sendRPC(open, out, urgent)
+				if admitted != (free == 3) {
+					t.Fatalf("admitted=%v with %d free slots, need three", admitted, free)
+				}
+				if !admitted {
+					if len(q.queue.normal) != 1 || q.queue.normal[0] != normal || len(q.queue.priority) != 1 || q.queue.priority[0] != priority {
+						t.Fatal("refusing a split RPC changed the queue")
+					}
+					return
+				}
+				if q.queue.Len() != 5 {
+					t.Fatalf("queue has %d RPCs, want the backlog plus three fragments", q.queue.Len())
+				}
+				var got []string
+				for q.queue.Len() > 0 {
+					rpc := popNext(t, q)
+					if rpc == normal || rpc == priority {
+						continue
+					}
+					if rpc.exceedsSizeLimits(64, 48) {
+						t.Fatal("an oversized fragment was admitted")
+					}
+					for _, iw := range rpc.GetControl().GetIwant() {
+						got = append(got, iw.MessageIDs...)
+					}
+				}
+				if !slices.Equal(got, mids) {
+					t.Fatalf("queued ids %v, want %v", got, mids)
+				}
+			})
+		}
+	}
+
+	t.Run("an unsplittable id refuses every fragment", func(t *testing.T) {
+		gs, q := newRefusalRouter(t, full, open)
+		gs.p.maxMessageSize, gs.p.maxControlMessageSize = 64, 48
+		out := rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{"valid", strings.Repeat("x", 128)}}}, nil, nil, nil)
+		if gs.sendRPC(open, out, true) || q.queue.Len() != 0 {
+			t.Fatal("an oversized id allowed a partially admitted request")
+		}
+	})
+
+	t.Run("piggybacked control has independent admission", func(t *testing.T) {
+		gs, _ := newRefusalRouter(t, full, open)
+		gs.p.maxMessageSize, gs.p.maxControlMessageSize = 64, 48
+		q := newRpcQueue(3)
+		gs.p.peers[open] = q
+		topic := "t"
+		gs.gossip = map[peer.ID][]*pb.ControlIHave{open: {{TopicID: &topic, MessageIDs: []string{"pending"}}}}
+		out := rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: mids}}, nil, nil, nil)
+		if gs.sendRPC(open, out, false) {
+			t.Fatal("the split request fit after piggybacked control took a slot")
+		}
+		if q.queue.Len() != 1 {
+			t.Fatalf("queue has %d RPCs, want only the independent piggyback", q.queue.Len())
+		}
+		rpc := popNext(t, q)
+		if got := rpc.GetControl().GetIhave(); len(got) != 1 || got[0].MessageIDs[0] != "pending" || len(rpc.GetControl().GetIwant()) != 0 {
+			t.Fatalf("queued %v, want only the pending IHAVE", rpc)
+		}
+	})
 }
 
 // TestRefusedIWantBlamesNobody drives a real refusal through the offer-table retry: the
