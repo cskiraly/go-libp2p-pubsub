@@ -239,7 +239,7 @@ func (gs *GossipSubRouter) replayDeferred() {
 		// Shuffle before selection, not after: the policies record state as a side effect
 		// of allowing an id, so selecting freely and truncating would leave phantom entries.
 		shuffleStrings(mids)
-		lst := gs.selectIWants(mids, topicOf, pid, allowance)
+		lst, attempts := gs.selectIWants(mids, topicOf, pid, allowance)
 		if len(lst) == 0 {
 			continue
 		}
@@ -249,7 +249,7 @@ func (gs *GossipSubRouter) replayDeferred() {
 		if !gs.sendRPC(pid, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: lst}}, nil, nil, nil), true) {
 			// Never transmitted: undo the charges and keep the deferral, so the next replay
 			// can try again rather than losing the announcement to our own queue.
-			gs.undoIWantDispatch(pid, lst, traced)
+			gs.undoIWantDispatch(pid, lst, attempts, traced)
 			continue
 		}
 		for _, mid := range lst {

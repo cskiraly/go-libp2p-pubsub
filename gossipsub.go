@@ -934,7 +934,7 @@ func (gs *GossipSubRouter) HandleRPC(rpc *RPC) {
 		return
 	}
 
-	iwant, traced := gs.handleIHave(rpc.from, ctl)
+	iwant, attempts, traced := gs.handleIHave(rpc.from, ctl)
 	iWantResponses := gs.handleIWant(rpc.from, ctl)
 	prune := gs.handleGraft(rpc.from, ctl)
 	gs.handlePrune(rpc.from, ctl)
@@ -959,7 +959,7 @@ func (gs *GossipSubRouter) HandleRPC(rpc *RPC) {
 			asked = append(asked, iw.GetMessageIDs()...)
 		}
 		if !gs.sendRPC(rpc.from, rpcWithControl(nil, nil, iwant, nil, nil, nil), true) {
-			gs.undoIWantDispatch(rpc.from, asked, traced)
+			gs.undoIWantDispatch(rpc.from, asked, attempts, traced)
 		}
 	}
 
@@ -969,23 +969,23 @@ func (gs *GossipSubRouter) HandleRPC(rpc *RPC) {
 	}
 }
 
-func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb.ControlIWant, promiseTrace) {
+func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb.ControlIWant, map[string]iwantAttempt, promiseTrace) {
 	// we ignore IHAVE gossip from any peer whose score is below the gossip threshold
 	score := gs.score.Score(p)
 	if score < gs.gossipThreshold {
 		gs.logger.Debug("IHAVE: ignoring peer with score below threshold", "peer", p, "score", score)
-		return nil, promiseTrace{}
+		return nil, nil, promiseTrace{}
 	}
 
 	// IHAVE flood protection
 	gs.peerhave[p]++
 	if gs.peerhave[p] > gs.params.MaxIHaveMessages {
 		gs.logger.Debug("IHAVE: peer has advertised too many times within this heartbeat interval; ignoring", "peer", p, "count", gs.peerhave[p])
-		return nil, promiseTrace{}
+		return nil, nil, promiseTrace{}
 	}
 	if gs.iasked[p] >= gs.params.MaxIHaveLength {
 		gs.logger.Debug("IHAVE: peer has already advertised too many messages; ignoring", "peer", p, "messageCount", gs.iasked[p])
-		return nil, promiseTrace{}
+		return nil, nil, promiseTrace{}
 	}
 
 	// iwant is the dedup set; an id announced under several topics keeps the first.
@@ -1029,7 +1029,7 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb
 	}
 
 	if len(candidates) == 0 {
-		return nil, promiseTrace{}
+		return nil, nil, promiseTrace{}
 	}
 
 	// Decide the per-peer allowance before consulting any request policy. The policies record
@@ -1040,13 +1040,13 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb
 	// ids we ask for by ordering its IHAVE -- while making selection and dispatch the same set.
 	allowance := gs.params.MaxIHaveLength - gs.iasked[p]
 	if allowance <= 0 {
-		return nil, promiseTrace{}
+		return nil, nil, promiseTrace{}
 	}
 	shuffleStrings(candidates)
 
-	iwantlst := gs.selectIWants(candidates, iwant, p, allowance)
+	iwantlst, attempts := gs.selectIWants(candidates, iwant, p, allowance)
 	if len(iwantlst) == 0 {
-		return nil, promiseTrace{}
+		return nil, nil, promiseTrace{}
 	}
 
 	gs.logger.Debug("IHAVE: Asking for messages from peer", "asking", len(iwantlst), "candidates", len(candidates), "peer", p)
@@ -1057,7 +1057,7 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb
 	// that were actually made rather than for ids a later policy refused.
 	gs.gateCommitted(p, iwantlst)
 
-	return []*pb.ControlIWant{{MessageIDs: iwantlst}}, traced
+	return []*pb.ControlIWant{{MessageIDs: iwantlst}}, attempts, traced
 }
 
 // selectIWants picks at most allowance ids from candidates, consulting the active request
@@ -1072,11 +1072,12 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) ([]*pb
 // any of them would burn the id on every decline, and an application that declines now and
 // wants the same id later could never come back for it. Ahead of them, a decline touches
 // nothing and is retryable.
-func (gs *GossipSubRouter) selectIWants(candidates []string, topicOf map[string]string, p peer.ID, allowance int) []string {
+func (gs *GossipSubRouter) selectIWants(candidates []string, topicOf map[string]string, p peer.ID, allowance int) ([]string, map[string]iwantAttempt) {
 	if allowance <= 0 {
-		return nil
+		return nil, nil
 	}
 	out := make([]string, 0, min(len(candidates), allowance))
+	var attempts map[string]iwantAttempt
 	for _, mid := range candidates {
 		if len(out) >= allowance {
 			break
@@ -1085,12 +1086,19 @@ func (gs *GossipSubRouter) selectIWants(candidates []string, topicOf map[string]
 			gs.noteDeclined(p, topicOf[mid], mid)
 			continue
 		}
-		if !gs.iwantAllowed(mid, topicOf[mid], p) {
+		allowed, attempt := gs.iwantAllowed(mid, topicOf[mid], p)
+		if !allowed {
 			continue
 		}
 		out = append(out, mid)
+		if !attempt.at.IsZero() {
+			if attempts == nil {
+				attempts = make(map[string]iwantAttempt)
+			}
+			attempts[mid] = attempt
+		}
 	}
-	return out
+	return out, attempts
 }
 
 func (gs *GossipSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb.Message {

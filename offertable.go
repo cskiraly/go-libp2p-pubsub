@@ -297,7 +297,8 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) {
 		}
 		return
 	}
-	if !gs.iwantAllowed(mid, gs.offers.topic[mid], pick) {
+	allowed, attempt := gs.iwantAllowed(mid, gs.offers.topic[mid], pick)
+	if !allowed {
 		return
 	}
 	gs.iasked[pick]++
@@ -306,7 +307,7 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) {
 	if !gs.sendRPC(pick, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{mid}}}, nil, nil, nil), true) {
 		// Never transmitted: undo the charges and come back once the cooldown has rotated
 		// selection past this peer.
-		gs.undoIWantDispatch(pick, []string{mid}, traced)
+		gs.undoIWantDispatch(pick, []string{mid}, map[string]iwantAttempt{mid: attempt}, traced)
 		gs.armOfferRetry(mid)
 	}
 }

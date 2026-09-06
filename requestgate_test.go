@@ -51,7 +51,7 @@ func TestRequestGateDeclineIsRetryable(t *testing.T) {
 
 	t.Run("a closed gate declines everything and records nothing", func(t *testing.T) {
 		gs := newGateRouter(func(string, string) bool { return false })
-		if got := gs.selectIWants(candidates, nil, peer.ID("p"), allowance); len(got) != 0 {
+		if got, _ := gs.selectIWants(candidates, nil, peer.ID("p"), allowance); len(got) != 0 {
 			t.Fatalf("dispatched %d ids through a closed gate", len(got))
 		}
 		if len(gs.iwantAsked) != 0 {
@@ -67,7 +67,7 @@ func TestRequestGateDeclineIsRetryable(t *testing.T) {
 		gs := newGateRouter(func(string, string) bool { return open })
 		gs.selectIWants(candidates, nil, peer.ID("p"), allowance)
 		open = true
-		got := gs.selectIWants(candidates, nil, peer.ID("p"), allowance)
+		got, _ := gs.selectIWants(candidates, nil, peer.ID("p"), allowance)
 		if len(got) != len(candidates) {
 			t.Fatalf("after opening the gate, dispatched %d of %d ids -- the decline was not retryable",
 				len(got), len(candidates))
@@ -76,7 +76,7 @@ func TestRequestGateDeclineIsRetryable(t *testing.T) {
 
 	t.Run("a declined id does not consume another id's allowance", func(t *testing.T) {
 		gs := newGateRouter(func(_, mid string) bool { return mid != "a" && mid != "b" })
-		got := gs.selectIWants(candidates, nil, peer.ID("p"), 2)
+		got, _ := gs.selectIWants(candidates, nil, peer.ID("p"), 2)
 		if len(got) != 2 || got[0] != "c" || got[1] != "d" {
 			t.Fatalf("dispatched %v, want [c d]", got)
 		}
@@ -111,7 +111,7 @@ func TestRequestGateCommitsOnlyDispatched(t *testing.T) {
 	// The discipline refuses "b": an ask for it is already in flight.
 	gs.iwantAsked["b"] = time.Now()
 
-	got := gs.selectIWants([]string{"a", "b", "c"}, nil, peer.ID("p"), 3)
+	got, _ := gs.selectIWants([]string{"a", "b", "c"}, nil, peer.ID("p"), 3)
 
 	if len(allowed) != 3 {
 		t.Fatalf("gate consulted for %v, want all three candidates", allowed)

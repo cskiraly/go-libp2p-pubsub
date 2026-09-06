@@ -115,14 +115,14 @@ func TestOfferTable(t *testing.T) {
 	t.Run("an ask for an untracked id leaves no record and no retry", func(t *testing.T) {
 		gs := newOfferRouter()
 		// No recordOffer: the offer was refused (budget, cap) or never made.
-		if !gs.iwantAllowed("m", "t", a) {
+		if allowed, _ := gs.iwantAllowed("m", "t", a); !allowed {
 			t.Fatal("the ask was refused")
 		}
 		if len(gs.offers.tried) != 0 || len(gs.offers.armed) != 0 || len(gs.offers.retries) != 0 {
 			t.Fatal("an untracked id got a tried record or a retry check")
 		}
 		gs.iwantGranted[a] = disciplinedAsksPerHeartbeat
-		if gs.iwantAllowed("capped", "t", a) {
+		if allowed, _ := gs.iwantAllowed("capped", "t", a); allowed {
 			t.Fatal("an untracked ask beyond the cap was allowed")
 		}
 		if len(gs.offers.armed) != 0 || len(gs.offers.retries) != 0 {
@@ -140,7 +140,7 @@ func TestOfferTable(t *testing.T) {
 		topic := "t"
 		mids := []string{"m1", "m2"}
 
-		if got, _ := gs.handleIHave(a, &pb.ControlMessage{Ihave: []*pb.ControlIHave{{
+		if got, _, _ := gs.handleIHave(a, &pb.ControlMessage{Ihave: []*pb.ControlIHave{{
 			TopicID: &topic, MessageIDs: mids,
 		}}}); len(got) != 0 {
 			t.Fatalf("capped IHAVE produced %d IWANTs", len(got))
@@ -190,7 +190,7 @@ func TestOfferTable(t *testing.T) {
 		gs.iwantGranted = map[peer.ID]int{a: disciplinedAsksPerHeartbeat}
 		topic := "t"
 		ctl := &pb.ControlMessage{Ihave: []*pb.ControlIHave{{TopicID: &topic, MessageIDs: []string{"m"}}}}
-		if got, _ := gs.handleIHave(a, ctl); len(got) != 0 {
+		if got, _, _ := gs.handleIHave(a, ctl); len(got) != 0 {
 			t.Fatal("the capped announcement produced an ask")
 		}
 		gs.recordOffer("m", topic, b)
@@ -200,7 +200,7 @@ func TestOfferTable(t *testing.T) {
 		queued := gs.offers.retries[0]
 
 		gs.clearIWantAsked()
-		got, _ := gs.handleIHave(a, ctl)
+		got, _, _ := gs.handleIHave(a, ctl)
 		if len(got) != 1 || !gs.promiseOpen("m", a) {
 			t.Fatal("the fresh announcement did not open an ask")
 		}
@@ -237,7 +237,7 @@ func TestOfferTable(t *testing.T) {
 	t.Run("an early check stops when all offers expired", func(t *testing.T) {
 		gs := newOfferRouter()
 		gs.recordOffer("m", "t", a)
-		if !gs.iwantAllowed("m", "t", a) {
+		if allowed, _ := gs.iwantAllowed("m", "t", a); !allowed {
 			t.Fatal("the ask was refused")
 		}
 		gs.offers.offers["m"][a] = time.Now().Add(-offerTTL)
@@ -295,7 +295,7 @@ func TestOfferTable(t *testing.T) {
 			gs.recordOffer("m", "t", peer.ID(fmt.Sprintf("p%02d", i)))
 		}
 		gs.recordOffer("m", "t", a)
-		if !gs.iwantAllowed("m", "t", a) {
+		if allowed, _ := gs.iwantAllowed("m", "t", a); !allowed {
 			t.Fatal("the ask was refused")
 		}
 		if _, tried := gs.offers.tried["m"][a]; tried {
@@ -313,7 +313,7 @@ func TestOfferTable(t *testing.T) {
 			gs.recordOffer(fmt.Sprintf("other-%d", i), "t", a)
 		}
 		gs.recordOffer("m", "t", a)
-		if !gs.iwantAllowed("m", "t", a) {
+		if allowed, _ := gs.iwantAllowed("m", "t", a); !allowed {
 			t.Fatal("the ask was refused")
 		}
 		if _, tried := gs.offers.tried["m"][a]; tried {
@@ -374,7 +374,7 @@ func TestOfferTable(t *testing.T) {
 		}
 		gs.recordOffer("m", "t", a)
 		gs.recordOffer("m", "t", b)
-		if !gs.iwantAllowed("m", "t", a) {
+		if allowed, _ := gs.iwantAllowed("m", "t", a); !allowed {
 			t.Fatal("the first ask was refused")
 		}
 		if p, ok, _ := gs.pickOfferedPeer("m"); !ok || p != b {
@@ -461,7 +461,7 @@ func TestOfferTable(t *testing.T) {
 		gs := newOfferRouter()
 		gs.recordOffer("m", "t", a)
 		gs.recordOffer("m", "t", b)
-		if !gs.iwantAllowed("m", "t", a) {
+		if allowed, _ := gs.iwantAllowed("m", "t", a); !allowed {
 			t.Fatal("the first ask was refused")
 		}
 		if _, was := gs.offers.tried["m"][a]; !was {

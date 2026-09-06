@@ -49,8 +49,16 @@ func (gs *GossipSubRouter) disciplined(topic string) bool {
 	return gs.iwantAsked != nil && (gs.iwantMatch == nil || gs.iwantMatch(topic))
 }
 
+// iwantAttempt identifies the refundable discipline state created by one allowed ask.
+// An undisciplined ask returns a zero token and owns no window, promise or cap charge.
+type iwantAttempt struct {
+	at         time.Time
+	capCharged bool
+}
+
 // iwantAllowed reports whether an IWANT for mid, announced on topic, may be issued to from
-// now, recording it if so. Runs on pubsub's goroutine, like every router map.
+// now, recording it if so and returning its undo token. Runs on pubsub's goroutine, like every
+// router map.
 //
 // A peer whose earlier ask for this id is still unjudged is refused even after the window has
 // moved on: the move-on exists to try someone else, and a repeat to the same peer could only
@@ -59,15 +67,15 @@ func (gs *GossipSubRouter) disciplined(topic string) bool {
 //
 // A peer at its per-heartbeat ask cap is refused too; the id stays unasked and open to the
 // next announcer, or to this one after the heartbeat.
-func (gs *GossipSubRouter) iwantAllowed(mid, topic string, from peer.ID) bool {
+func (gs *GossipSubRouter) iwantAllowed(mid, topic string, from peer.ID) (bool, iwantAttempt) {
 	if !gs.disciplined(topic) {
-		return true
+		return true, iwantAttempt{}
 	}
 	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
-		return false
+		return false, iwantAttempt{}
 	}
 	if gs.promiseOpen(mid, from) {
-		return false
+		return false, iwantAttempt{}
 	}
 	if gs.iwantGranted[from] >= disciplinedAsksPerHeartbeat {
 		// A tracked offer must not lose its only path back to selection merely
@@ -78,7 +86,7 @@ func (gs *GossipSubRouter) iwantAllowed(mid, topic string, from peer.ID) bool {
 				gs.armOfferRetry(mid)
 			}
 		}
-		return false
+		return false, iwantAttempt{}
 	}
 	if gs.iwantGranted == nil {
 		gs.iwantGranted = make(map[peer.ID]int)
@@ -87,7 +95,7 @@ func (gs *GossipSubRouter) iwantAllowed(mid, topic string, from peer.ID) bool {
 	gs.iwantAsked[mid] = time.Now()
 	gs.notePromise(mid, from, gs.iwantAsked[mid])
 	gs.noteOfferTried(mid, from)
-	return true
+	return true, iwantAttempt{at: gs.iwantAsked[mid], capCharged: true}
 }
 
 // noteDelivered runs on every received message: delivery keeps every open promise for the
@@ -111,7 +119,7 @@ func (gs *GossipSubRouter) noteDelivered(mid string) {
 // down for one window so the next selection rotates past it, and the offer table's record of
 // the attempt stays, because selection prefers untried announcers and forgetting the attempt
 // would make the peer whose queue is full the most attractive candidate again.
-func (gs *GossipSubRouter) undoIWantDispatch(p peer.ID, mids []string, traced promiseTrace) {
+func (gs *GossipSubRouter) undoIWantDispatch(p peer.ID, mids []string, attempts map[string]iwantAttempt, traced promiseTrace) {
 	if len(mids) == 0 {
 		return
 	}
@@ -123,18 +131,24 @@ func (gs *GossipSubRouter) undoIWantDispatch(p peer.ID, mids []string, traced pr
 	gs.gossipTracer.dropPromise(p, traced)
 	gs.gateFailed(p, mids)
 	for _, mid := range mids {
+		attempt := attempts[mid]
+		if attempt.at.IsZero() {
+			continue
+		}
 		if pk := gs.park; pk != nil {
-			if peers := pk.promised[mid]; peers != nil {
+			if peers := pk.promised[mid]; peers[p].Equal(attempt.at) {
 				delete(peers, p)
 				if len(peers) == 0 {
 					delete(pk.promised, mid)
 				}
 			}
 		}
-		// Only a disciplined id has a window record, and only that ask counted against the
-		// peer's cap.
-		if _, asked := gs.iwantAsked[mid]; asked {
+		// Other attempts may own the current window or promise. Only undo this dispatch's
+		// records, and refund its cap charge independently of whether the window remains.
+		if gs.iwantAsked[mid].Equal(attempt.at) {
 			delete(gs.iwantAsked, mid)
+		}
+		if attempt.capCharged {
 			if gs.iwantGranted[p] > 1 {
 				gs.iwantGranted[p]--
 			} else {

@@ -17,17 +17,17 @@ func TestIWantDisciplineOneOutstanding(t *testing.T) {
 		iwantAsked:  make(map[string]time.Time),
 		iwantWindow: 50 * time.Millisecond,
 	}
-	if !gs.iwantAllowed("m", "t", peer.ID("a")) {
+	if allowed, _ := gs.iwantAllowed("m", "t", peer.ID("a")); !allowed {
 		t.Fatal("the first ask was refused")
 	}
-	if gs.iwantAllowed("m", "t", peer.ID("b")) {
+	if allowed, _ := gs.iwantAllowed("m", "t", peer.ID("b")); allowed {
 		t.Fatal("a second ask inside the window was allowed")
 	}
-	if !gs.iwantAllowed("other", "t", peer.ID("b")) {
+	if allowed, _ := gs.iwantAllowed("other", "t", peer.ID("b")); !allowed {
 		t.Fatal("an unrelated id was refused")
 	}
 	time.Sleep(60 * time.Millisecond)
-	if !gs.iwantAllowed("m", "t", peer.ID("b")) {
+	if allowed, _ := gs.iwantAllowed("m", "t", peer.ID("b")); !allowed {
 		t.Fatal("the id did not reopen after the window")
 	}
 	// "other" was asked before the sleep and has expired; "m" was just re-asked and is live.
@@ -47,7 +47,7 @@ func TestIWantDisciplineOneOutstanding(t *testing.T) {
 func TestIWantDisciplineOffIsStock(t *testing.T) {
 	gs := &GossipSubRouter{}
 	for range 3 {
-		if !gs.iwantAllowed("m", "t", peer.ID("a")) {
+		if allowed, attempt := gs.iwantAllowed("m", "t", peer.ID("a")); !allowed || attempt != (iwantAttempt{}) {
 			t.Fatal("an ask was refused with the discipline off")
 		}
 	}
@@ -63,14 +63,16 @@ func TestIWantDisciplineScopedToTopics(t *testing.T) {
 		iwantMatch:  func(topic string) bool { return topic == "segments" },
 	}
 	for range 3 {
-		if !gs.iwantAllowed("m", "blocks", peer.ID("a")) {
+		if allowed, attempt := gs.iwantAllowed("m", "blocks", peer.ID("a")); !allowed || attempt != (iwantAttempt{}) {
 			t.Fatal("an ask on an unmatched topic was refused")
 		}
 	}
 	if len(gs.iwantAsked) != 0 {
 		t.Fatal("an unmatched topic recorded an ask")
 	}
-	if !gs.iwantAllowed("m", "segments", peer.ID("a")) || gs.iwantAllowed("m", "segments", peer.ID("b")) {
+	first, _ := gs.iwantAllowed("m", "segments", peer.ID("a"))
+	second, _ := gs.iwantAllowed("m", "segments", peer.ID("b"))
+	if !first || second {
 		t.Fatal("the matched topic is not disciplined")
 	}
 }
@@ -85,18 +87,23 @@ func TestIWantDisciplineAskCap(t *testing.T) {
 		iwantMatch:  func(topic string) bool { return topic == "t" },
 	}
 	a, b := peer.ID("a"), peer.ID("b")
+	var firstAttempt iwantAttempt
 	for i := range disciplinedAsksPerHeartbeat {
-		if !gs.iwantAllowed(fmt.Sprintf("m%d", i), "t", a) {
+		allowed, attempt := gs.iwantAllowed(fmt.Sprintf("m%d", i), "t", a)
+		if !allowed {
 			t.Fatalf("ask %d was refused below the cap", i)
 		}
+		if i == 0 {
+			firstAttempt = attempt
+		}
 	}
-	if gs.iwantAllowed("over", "t", a) {
+	if allowed, _ := gs.iwantAllowed("over", "t", a); allowed {
 		t.Fatal("an ask beyond the cap was allowed")
 	}
-	if !gs.iwantAllowed("over", "t", b) {
+	if allowed, _ := gs.iwantAllowed("over", "t", b); !allowed {
 		t.Fatal("another peer's ask was refused by a's cap")
 	}
-	if !gs.iwantAllowed("free", "blocks", a) {
+	if allowed, _ := gs.iwantAllowed("free", "blocks", a); !allowed {
 		t.Fatal("an undisciplined topic was capped")
 	}
 	if gs.iwantGranted[a] != disciplinedAsksPerHeartbeat {
@@ -104,11 +111,11 @@ func TestIWantDisciplineAskCap(t *testing.T) {
 	}
 
 	// A dispatch refused at admission refunds the ask, and only for the disciplined id.
-	gs.undoIWantDispatch(a, []string{"m0", "free"}, promiseTrace{})
+	gs.undoIWantDispatch(a, []string{"m0", "free"}, map[string]iwantAttempt{"m0": firstAttempt}, promiseTrace{})
 	if gs.iwantGranted[a] != disciplinedAsksPerHeartbeat-1 {
 		t.Fatalf("granted = %d after one refund, want %d", gs.iwantGranted[a], disciplinedAsksPerHeartbeat-1)
 	}
-	if !gs.iwantAllowed("m0", "t", a) {
+	if allowed, _ := gs.iwantAllowed("m0", "t", a); !allowed {
 		t.Fatal("the refund did not reopen the cap")
 	}
 
@@ -116,7 +123,7 @@ func TestIWantDisciplineAskCap(t *testing.T) {
 	if len(gs.iwantGranted) != 0 {
 		t.Fatal("the heartbeat did not reset the ask counts")
 	}
-	if !gs.iwantAllowed("next", "t", a) {
+	if allowed, _ := gs.iwantAllowed("next", "t", a); !allowed {
 		t.Fatal("the cap did not reopen with the heartbeat")
 	}
 }
@@ -141,7 +148,7 @@ func TestSelectIWantsRecordsOnlyDispatched(t *testing.T) {
 		candidates[i] = string(rune('a' + i))
 	}
 
-	got := gs.selectIWants(candidates, nil, peer.ID("peer-1"), allowance)
+	got, _ := gs.selectIWants(candidates, nil, peer.ID("peer-1"), allowance)
 
 	if len(got) != allowance {
 		t.Fatalf("dispatched %d ids, want the full allowance %d", len(got), allowance)
@@ -167,7 +174,7 @@ func TestSelectIWantsZeroAllowance(t *testing.T) {
 		iwantAsked:  make(map[string]time.Time),
 		iwantWindow: time.Minute,
 	}
-	if got := gs.selectIWants([]string{"a", "b"}, nil, peer.ID("p"), 0); len(got) != 0 {
+	if got, _ := gs.selectIWants([]string{"a", "b"}, nil, peer.ID("p"), 0); len(got) != 0 {
 		t.Fatalf("dispatched %d ids at zero allowance", len(got))
 	}
 	if len(gs.iwantAsked) != 0 {

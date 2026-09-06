@@ -178,6 +178,88 @@ func TestRefusedIWantPreservesEarlierTracerPromise(t *testing.T) {
 	}
 }
 
+func TestRefusedIWantPreservesEarlierDisciplineState(t *testing.T) {
+	t.Run("unmatched IHAVE cannot refund an open segment ask", func(t *testing.T) {
+		full, open := peer.ID("full"), peer.ID("open")
+		gs, _ := newRefusalRouter(t, full, open)
+		gs.iwantMatch = func(topic string) bool { return topic == "segments" }
+		gs.p.peerFilter = DefaultPeerFilter
+		gs.mesh = map[string]map[peer.ID]struct{}{"segments": {}, "blocks": {}}
+		gs.peerhave = make(map[peer.ID]int)
+		gs.extensions = newExtensionsState(PeerExtensions{}, func(peer.ID) {}, func(p peer.ID, out *RPC, urgent bool) { gs.sendRPC(p, out, urgent) })
+		fq := gs.p.peers[full]
+		backlog := popNext(t, fq)
+		gs.recordOffer("m", "segments", full)
+		gs.retryOfferedPull("m")
+		popNext(t, fq) // the segment ask was transmitted
+		at := gs.iwantAsked["m"]
+		if at.IsZero() || !gs.park.promised["m"][full].Equal(at) || gs.iwantGranted[full] != 1 {
+			t.Fatal("the segment ask did not record its window, promise and cap charge")
+		}
+		if err := fq.Push(backlog, false); err != nil {
+			t.Fatal(err)
+		}
+
+		topic := "blocks"
+		gs.HandleRPC(&RPC{from: full, RPC: pb.RPC{Control: &pb.ControlMessage{
+			Ihave: []*pb.ControlIHave{{TopicID: &topic, MessageIDs: []string{"m"}}},
+		}}})
+
+		if !gs.sendRefusedRecently(full) {
+			t.Fatal("the unmatched-topic ask did not reach admission refusal")
+		}
+		if !gs.iwantAsked["m"].Equal(at) || !gs.park.promised["m"][full].Equal(at) {
+			t.Fatal("the unmatched-topic refusal erased the earlier window or promise")
+		}
+		if gs.iwantGranted[full] != 1 || gs.iasked[full] != 1 {
+			t.Fatalf("earlier charges changed: discipline=%d iasked=%d, want 1 each", gs.iwantGranted[full], gs.iasked[full])
+		}
+		if popNext(t, fq) != backlog || fq.queue.Len() != 0 {
+			t.Fatal("the refused ask changed the full queue")
+		}
+		gs.promiseDue("m", full, at)
+		if !gs.peerParked(full) {
+			t.Fatal("the earlier unserved ask escaped judgment")
+		}
+	})
+
+	t.Run("undo preserves replacement stamps and refunds its own cap charge", func(t *testing.T) {
+		full, open := peer.ID("full"), peer.ID("open")
+		gs, _ := newRefusalRouter(t, full, open)
+		allowed, attempt := gs.iwantAllowed("m", "t", full)
+		if !allowed {
+			t.Fatal("the ask was refused")
+		}
+		next := attempt.at.Add(time.Second)
+		gs.iwantAsked["m"] = next
+		gs.park.promised["m"][full] = next
+		gs.park.promised["m"][open] = next
+		gs.iwantGranted[full]++
+
+		gs.undoIWantDispatch(full, []string{"m"}, map[string]iwantAttempt{"m": attempt}, promiseTrace{})
+		if !gs.iwantAsked["m"].Equal(next) || !gs.park.promised["m"][full].Equal(next) || !gs.park.promised["m"][open].Equal(next) {
+			t.Fatal("undo changed state owned by another attempt")
+		}
+		if gs.iwantGranted[full] != 1 {
+			t.Fatalf("cap count = %d, want only the replacement charge", gs.iwantGranted[full])
+		}
+	})
+
+	t.Run("a missing window does not lose the cap refund", func(t *testing.T) {
+		full, open := peer.ID("full"), peer.ID("open")
+		gs, _ := newRefusalRouter(t, full, open)
+		allowed, attempt := gs.iwantAllowed("m", "t", full)
+		if !allowed {
+			t.Fatal("the ask was refused")
+		}
+		delete(gs.iwantAsked, "m")
+		gs.undoIWantDispatch(full, []string{"m"}, map[string]iwantAttempt{"m": attempt}, promiseTrace{})
+		if gs.promiseOpen("m", full) || gs.iwantGranted[full] != 0 {
+			t.Fatal("undo left its promise or cap charge after the window was cleared")
+		}
+	})
+}
+
 // TestDisconnectedAnnouncerIsSkipped: an announcer that left has no queue, so it is not a
 // candidate; nothing is charged and nothing is sent.
 func TestDisconnectedAnnouncerIsSkipped(t *testing.T) {

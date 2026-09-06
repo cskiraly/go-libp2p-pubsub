@@ -102,18 +102,18 @@ func TestCommitmentPark(t *testing.T) {
 	t.Run("a peer with an open promise is not re-asked and its promise keeps its deadline", func(t *testing.T) {
 		gs := newParkRouter(1, time.Second, time.Hour)
 		gs.iwantWindow = time.Millisecond
-		if !gs.iwantAllowed("m", "t", a) {
+		if allowed, _ := gs.iwantAllowed("m", "t", a); !allowed {
 			t.Fatal("the first ask was refused")
 		}
 		first := gs.park.promised["m"][a]
 		time.Sleep(5 * time.Millisecond) // the discipline window has moved on
-		if gs.iwantAllowed("m", "t", a) {
+		if allowed, _ := gs.iwantAllowed("m", "t", a); allowed {
 			t.Fatal("a re-ask to a peer with an open promise was allowed")
 		}
 		if !gs.park.promised["m"][a].Equal(first) {
 			t.Fatal("the re-ask re-stamped the promise")
 		}
-		if !gs.iwantAllowed("m", "t", b) {
+		if allowed, _ := gs.iwantAllowed("m", "t", b); !allowed {
 			t.Fatal("moving on to another announcer was refused")
 		}
 		// The original timer still judges the first ask.
@@ -184,7 +184,7 @@ func TestCommitmentPark(t *testing.T) {
 	t.Run("asks share one timer and are judged in ask order from the queue", func(t *testing.T) {
 		gs := newParkRouter(10, 10*time.Millisecond, time.Hour)
 		for _, mid := range []string{"m1", "m2", "m3"} {
-			if !gs.iwantAllowed(mid, "t", a) {
+			if allowed, _ := gs.iwantAllowed(mid, "t", a); !allowed {
 				t.Fatalf("ask for %s refused", mid)
 			}
 		}
@@ -206,11 +206,11 @@ func TestCommitmentPark(t *testing.T) {
 
 	t.Run("a sweep judges only what is due and re-arms for the rest", func(t *testing.T) {
 		gs := newParkRouter(10, 20*time.Millisecond, time.Hour)
-		if !gs.iwantAllowed("m1", "t", a) {
+		if allowed, _ := gs.iwantAllowed("m1", "t", a); !allowed {
 			t.Fatal("ask refused")
 		}
 		time.Sleep(25 * time.Millisecond)
-		if !gs.iwantAllowed("m2", "t", a) {
+		if allowed, _ := gs.iwantAllowed("m2", "t", a); !allowed {
 			t.Fatal("ask refused")
 		}
 		gs.sweepPromises()
@@ -224,7 +224,7 @@ func TestCommitmentPark(t *testing.T) {
 
 	t.Run("a kept promise is skipped at its deadline", func(t *testing.T) {
 		gs := newParkRouter(1, 10*time.Millisecond, time.Hour)
-		if !gs.iwantAllowed("m", "t", a) {
+		if allowed, _ := gs.iwantAllowed("m", "t", a); !allowed {
 			t.Fatal("ask refused")
 		}
 		gs.noteDelivered("m")
@@ -244,7 +244,7 @@ func TestCommitmentPark(t *testing.T) {
 		gs := newParkRouter(1, time.Second, time.Hour)
 		at := gs.askForTest("m", a)
 		gs.promiseDue("m", a, at)
-		if !gs.iwantAllowed("m2", "t", a) {
+		if allowed, _ := gs.iwantAllowed("m2", "t", a); !allowed {
 			t.Fatal("iwantAllowed is expected to stay peer-blind")
 		}
 	})
