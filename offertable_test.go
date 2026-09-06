@@ -180,6 +180,74 @@ func TestOfferTable(t *testing.T) {
 		}
 	})
 
+	t.Run("an early check rearms for a fresh ask whose arm was suppressed", func(t *testing.T) {
+		gs := newOfferRouter()
+		gs.params = DefaultGossipSubParams()
+		gs.p.peerFilter = DefaultPeerFilter
+		gs.mesh = map[string]map[peer.ID]struct{}{"t": {}}
+		gs.peerhave = make(map[peer.ID]int)
+		gs.park = newParkRouter(1, time.Second, time.Hour).park
+		gs.iwantGranted = map[peer.ID]int{a: disciplinedAsksPerHeartbeat}
+		topic := "t"
+		ctl := &pb.ControlMessage{Ihave: []*pb.ControlIHave{{TopicID: &topic, MessageIDs: []string{"m"}}}}
+		if got, _ := gs.handleIHave(a, ctl); len(got) != 0 {
+			t.Fatal("the capped announcement produced an ask")
+		}
+		gs.recordOffer("m", topic, b)
+		if len(gs.offers.retries) != 1 {
+			t.Fatal("cap refusal did not queue one check")
+		}
+		queued := gs.offers.retries[0]
+
+		gs.clearIWantAsked()
+		got, _ := gs.handleIHave(a, ctl)
+		if len(got) != 1 || !gs.promiseOpen("m", a) {
+			t.Fatal("the fresh announcement did not open an ask")
+		}
+		if len(gs.offers.retries) != 1 || gs.offers.retries[0] != queued {
+			t.Fatal("the fresh ask did not retain the already queued check")
+		}
+		if !gs.sendRPC(a, rpcWithControl(nil, nil, got, nil, nil, nil), true) {
+			t.Fatal("the fresh ask was refused at admission")
+		}
+		popNext(t, gs.p.peers[a])
+
+		fireOfferRetries(gs) // the fresh ask's window is still open
+		if _, armed := gs.offers.armed["m"]; !armed || len(gs.offers.retries) != 1 {
+			t.Fatal("the early check lost the successor")
+		}
+		if !gs.offers.retries[0].due.After(time.Now()) || gs.iasked[b] != 0 {
+			t.Fatal("the early check did not wait for the fresh ask")
+		}
+
+		gs.promiseDue("m", a, gs.park.promised["m"][a])
+		if !gs.peerParked(a) {
+			t.Fatal("the unserved fresh ask was not judged")
+		}
+		fireOfferRetries(gs)
+		if !gs.promiseOpen("m", b) || gs.iasked[b] != 1 {
+			t.Fatal("the successor did not ask the other announcer")
+		}
+		rpc := popNext(t, gs.p.peers[b])
+		if got := rpc.GetControl().GetIwant(); len(got) != 1 || len(got[0].MessageIDs) != 1 || got[0].MessageIDs[0] != "m" {
+			t.Fatalf("successor queued %v, want an IWANT for m", got)
+		}
+	})
+
+	t.Run("an early check stops when all offers expired", func(t *testing.T) {
+		gs := newOfferRouter()
+		gs.recordOffer("m", "t", a)
+		if !gs.iwantAllowed("m", "t", a) {
+			t.Fatal("the ask was refused")
+		}
+		gs.offers.offers["m"][a] = time.Now().Add(-offerTTL)
+		gs.sweepOffers()
+		fireOfferRetries(gs)
+		if len(gs.offers.retries) != 0 || len(gs.offers.armed) != 0 {
+			t.Fatal("an expired id retained a retry check")
+		}
+	})
+
 	t.Run("the sweep drops tried records whose id is no longer tracked", func(t *testing.T) {
 		gs := newOfferRouter()
 		gs.offers.tried["orphan"] = map[peer.ID]time.Time{a: time.Now()}

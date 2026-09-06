@@ -274,7 +274,7 @@ func (gs *GossipSubRouter) pickOfferedPeer(mid string) (pick peer.ID, found, wai
 // retryOfferedPull runs on the router goroutine one window after an ask was granted. If the
 // id is still missing and no ask is in flight, it re-asks the best remembered announcer.
 func (gs *GossipSubRouter) retryOfferedPull(mid string) {
-	if gs.offers == nil {
+	if gs.offers == nil || len(gs.offers.offers[mid]) == 0 {
 		return
 	}
 	if gs.p.seenMessage(mid) {
@@ -282,7 +282,10 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) {
 		return
 	}
 	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
-		return // an ask is in flight; its own retry check is queued
+		// This check may predate the in-flight ask and have suppressed that ask's arm.
+		// Keep a successor so an unserved ask still gets retried after its window.
+		gs.armOfferRetry(mid)
+		return
 	}
 	pick, found, waiting := gs.pickOfferedPeer(mid)
 	if !found {
