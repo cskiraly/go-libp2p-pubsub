@@ -221,6 +221,82 @@ func TestOfferTable(t *testing.T) {
 		}
 	})
 
+	t.Run("an announcer refused by the per-id cap gets no tried entry", func(t *testing.T) {
+		gs := newOfferRouter()
+		for i := range offerPerID {
+			gs.recordOffer("m", "t", peer.ID(fmt.Sprintf("p%02d", i)))
+		}
+		gs.recordOffer("m", "t", a)
+		if !gs.iwantAllowed("m", "t", a) {
+			t.Fatal("the ask was refused")
+		}
+		if _, tried := gs.offers.tried["m"][a]; tried {
+			t.Fatal("an announcer without a retained offer got a tried entry")
+		}
+		if _, armed := gs.offers.armed["m"]; !armed {
+			t.Fatal("the tracked id lost its retry check")
+		}
+	})
+
+	t.Run("an announcer refused by its budget gets no tried entry", func(t *testing.T) {
+		gs := newOfferRouter()
+		gs.recordOffer("m", "t", b)
+		for i := range offerPerPeer {
+			gs.recordOffer(fmt.Sprintf("other-%d", i), "t", a)
+		}
+		gs.recordOffer("m", "t", a)
+		if !gs.iwantAllowed("m", "t", a) {
+			t.Fatal("the ask was refused")
+		}
+		if _, tried := gs.offers.tried["m"][a]; tried {
+			t.Fatal("an announcer without a retained offer got a tried entry")
+		}
+		if _, armed := gs.offers.armed["m"]; !armed {
+			t.Fatal("the tracked id lost its retry check")
+		}
+	})
+
+	t.Run("expiring an offer removes only its tried entry", func(t *testing.T) {
+		gs := newOfferRouter()
+		for _, p := range []peer.ID{a, b} {
+			gs.recordOffer("m", "t", p)
+			gs.noteOfferTried("m", p)
+		}
+		gs.offers.offers["m"][a] = time.Now().Add(-offerTTL)
+		gs.sweepOffers()
+		if _, tried := gs.offers.tried["m"][a]; tried {
+			t.Fatal("expired announcer kept its tried entry")
+		}
+		if _, tried := gs.offers.tried["m"][b]; !tried {
+			t.Fatal("retained announcer lost its tried entry")
+		}
+	})
+
+	t.Run("rotating announcers cannot grow tried history beyond the offer cap", func(t *testing.T) {
+		gs := newOfferRouter()
+		for window := range 4 * offerPerID {
+			// Refresh one offer so the id stays tracked across every rotation.
+			gs.recordOffer("m", "t", a)
+			gs.sweepOffers()
+			for i := range offerPerID + 1 {
+				p := peer.ID(fmt.Sprintf("p-%d-%d", window, i))
+				gs.recordOffer("m", "t", p)
+				gs.noteOfferTried("m", p)
+				if n := len(gs.offers.tried["m"]); n > offerPerID {
+					t.Fatalf("window %d: %d tried entries, cap %d", window, n, offerPerID)
+				}
+				for tried := range gs.offers.tried["m"] {
+					if _, retained := gs.offers.offers["m"][tried]; !retained {
+						t.Fatalf("window %d: tried announcer %q has no offer", window, tried)
+					}
+				}
+			}
+			for p := range gs.offers.offers["m"] {
+				gs.offers.offers["m"][p] = time.Now().Add(-offerTTL)
+			}
+		}
+	})
+
 	t.Run("an announcer with an open promise is skipped and waited for", func(t *testing.T) {
 		gs := newOfferRouter()
 		gs.park = &commitmentPark{k: 1, ttl: time.Hour, promise: time.Second,

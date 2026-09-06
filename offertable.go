@@ -96,9 +96,9 @@ func (gs *GossipSubRouter) recordOffer(mid, topic string, p peer.ID) {
 }
 
 // noteOfferTried records an ask granted to p for mid and queues the retry check one window
-// later. Only a tracked id gets a record: when recordOffer refused the offer (budget, cap,
-// expiry) there is nobody to re-ask, and a tried entry with no offers behind it would outlive
-// the id, since only clearOffers removes it.
+// later. Tried history follows retained offers, so it shares their per-id bound and expiry.
+// A tracked id still gets a retry when this announcer's offer was refused: other announcers
+// can serve it once the granted ask's window expires.
 func (gs *GossipSubRouter) noteOfferTried(mid string, p peer.ID) {
 	ot := gs.offers
 	if ot == nil {
@@ -107,10 +107,12 @@ func (gs *GossipSubRouter) noteOfferTried(mid string, p peer.ID) {
 	if _, tracked := ot.offers[mid]; !tracked {
 		return
 	}
-	if ot.tried[mid] == nil {
-		ot.tried[mid] = make(map[peer.ID]time.Time)
+	if _, retained := ot.offers[mid][p]; retained {
+		if ot.tried[mid] == nil {
+			ot.tried[mid] = make(map[peer.ID]time.Time)
+		}
+		ot.tried[mid][p] = time.Now()
 	}
-	ot.tried[mid][p] = time.Now()
 	gs.armOfferRetry(mid)
 }
 
@@ -207,6 +209,7 @@ func (gs *GossipSubRouter) sweepOffers() {
 		for p, at := range peers {
 			if time.Since(at) >= offerTTL {
 				delete(peers, p)
+				delete(ot.tried[mid], p)
 				ot.refundOffer(p)
 			}
 		}
