@@ -593,44 +593,101 @@ type GossipSubRouter struct {
 	peers      map[peer.ID]protocol.ID // peer protocols
 	extensions *extensionsState
 
-	direct         map[peer.ID]struct{}             // direct peers
-	mesh           map[string]map[peer.ID]struct{}  // topic meshes
-	fanout         map[string]map[peer.ID]struct{}  // topic fanout
-	lastpub        map[string]int64                 // last publish time for fanout topics
-	gossip         map[peer.ID][]*pb.ControlIHave   // pending gossip
-	control        map[peer.ID]*pb.ControlMessage   // pending control messages
-	peerhave       map[peer.ID]int                  // number of IHAVEs received from peer in the last heartbeat
-	peerdontwant   map[peer.ID]int                  // number of IDONTWANTs received from peer in the last heartbeat
-	unwanted       map[peer.ID]map[checksum]int     // TTL of the message ids peers don't want
-	phaseForward   *phaseForwarding                 // optional push-pull phase transition on the eager-push path
-	iwantWindow    time.Duration                    // optional one-outstanding-IWANT-per-id window
-	iwantAsked     map[string]time.Time             // message ids with an IWANT in flight, by request time
-	iwantHedge     time.Duration                    // optional: permit a 2nd IWANT after this elapsed
-	iwantCount     map[string]int                   // outstanding IWANTs per id, for the hedge cap
-	adaptHedge     *adaptiveHedge                   // optional: two-controller adaptive hedge (delay + AIMD rate)
-	nqg            *nqgConfig                       // optional: (N,q,g) request kernel
-	nqgAsked       map[string]map[peer.ID]time.Time // per-mid asked peers and times, for (N,q,g)
-	rttPeer        map[peer.ID]*peerQuantile        // per-peer response-time quantile (warms across payloads)
-	rttGlobal      *peerQuantile                    // global prior for cold peers
-	iwantBudgetMax int                              // optional PR-625-style per-heartbeat IWANT budget per id
-	iwantBudget    map[string]int                   // remaining budget by message id
-	rng            *rand.Rand                       // optional seeded shuffle source (deterministic mode)
-	withholdServe  bool                             // F1 injection: never/late IWANT service
-	withholdDelay  time.Duration                    // 0 = silent, >0 = serve whole after delay
-	withheldServes *atomic.Int64                    // verified-exposure counter, may be nil
-	lossClass      uint8                            // F2a injection: which class is shed at admission
-	lossPct        int                              // drop probability, percent
-	lossSeed       uint64                           // per-node seed from the harness
-	lossDropped    *atomic.Int64                    // verified-exposure counter, may be nil
-	phaseHolders   map[string]*phaseHolderEntry     // optional announce-fed holder tracking for phase forwarding
-	requestGate    RequestGate                      // optional application veto on requesting an announced id
-	deferred       map[string]*deferredEntry        // declined announcements, replayable when the gate opens
-	deferredMax    int                              // cap on deferred entries
-	iasked         map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
-	outbound       map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
-	backoff        map[string]map[peer.ID]time.Time // prune backoff
-	connect        chan connectInfo                 // px connection requests
-	cab            peerstore.AddrBook
+	direct         map[peer.ID]struct{}                         // direct peers
+	mesh           map[string]map[peer.ID]struct{}              // topic meshes
+	fanout         map[string]map[peer.ID]struct{}              // topic fanout
+	lastpub        map[string]int64                             // last publish time for fanout topics
+	gossip         map[peer.ID][]*pb.ControlIHave               // pending gossip
+	control        map[peer.ID]*pb.ControlMessage               // pending control messages
+	peerhave       map[peer.ID]int                              // number of IHAVEs received from peer in the last heartbeat
+	peerdontwant   map[peer.ID]int                              // number of IDONTWANTs received from peer in the last heartbeat
+	unwanted       map[peer.ID]map[checksum]int                 // TTL of the message ids peers don't want
+	phaseForward   *phaseForwarding                             // optional push-pull phase transition on the eager-push path
+	groupPush      *groupPush                                   // optional group-aware push suppression over phase forwarding
+	linkFilter     func(local, remote peer.ID, mid string) bool // optional per-(message, link) activation predicate
+	linkEnforce    bool                                         // bilateral link filter: verify inbound traffic against the predicate
+	linkViolations *atomic.Int64                                // optional violation counter, application-supplied
+	iwantWindow    time.Duration                                // optional one-outstanding-IWANT-per-id window
+	iwantAsked     map[string]time.Time                         // message ids with an IWANT in flight, by request time
+	iwantPromised  map[string]map[peer.ID]time.Time             // commitment enforcement: open promises per id — every peer asked, and when
+	parkK          int                                          // broken promises before a peer is parked (0 = enforcement off)
+	parkTTL        time.Duration                                // how long a parked peer's announcements are ineligible
+	parkPromise    time.Duration                                // proactive promise deadline; break + refund fire here
+	parkBreaks     map[peer.ID]int                              // broken-promise counts
+	parkedUntil    map[peer.ID]time.Time                        // parked peers by expiry
+	parkBreaksCtr  *atomic.Int64                                // exposure counters, may be nil
+	parksCtr       *atomic.Int64
+	iwantHedge     time.Duration             // optional: permit a 2nd IWANT after this elapsed
+	iwantCount     map[string]int            // outstanding IWANTs per id, for the hedge cap
+	adaptHedge     *adaptiveHedge            // optional: two-controller adaptive hedge (delay + AIMD rate)
+	tailK          int                       // optional tail hedge: outstanding IWANTs per id allowed once the node is in the tail (0 = off)
+	tailOn         bool                      // set on the router goroutine by EnterTailHedge
+	reqLedger      map[string]*RequestRecord // passive request observation (requestobs.go); nil when off
+	reqUnasked     int                       // first arrivals of ids never asked for
+	tailExtraCtr   *atomic.Int64             // hedged (extra) asks issued, may be nil
+	// the tail hedge's bounds and schedule (tailbounds.go); zero bounds and no schedule = the hedge as first built
+	tailBoundID, tailBoundGroup, tailBoundPeer                   int
+	tailAsks                                                     map[string]int  // asks per id over its life, first and retries included
+	tailExtraUsed                                                int             // extra asks issued in this group
+	tailPeerExtra                                                map[peer.ID]int // extra asks per serving peer in this group
+	tailSchedule                                                 bool
+	tailH                                                        int
+	tailMissing                                                  int
+	tailRefusedID, tailRefusedGroup, tailRefusedPeer, tailTopUps *atomic.Int64
+	nqg                                                          *nqgConfig                       // optional: (N,q,g) request kernel
+	nqgAsked                                                     map[string]map[peer.ID]time.Time // per-mid asked peers and times, for (N,q,g)
+	rttPeer                                                      map[peer.ID]*peerQuantile        // per-peer response-time quantile (warms across payloads)
+	rttGlobal                                                    *peerQuantile                    // global prior for cold peers
+	iwantBudgetMax                                               int                              // optional PR-625-style per-heartbeat IWANT budget per id
+	iwantBudget                                                  map[string]int                   // remaining budget by message id
+	rng                                                          *rand.Rand                       // optional seeded shuffle source (deterministic mode)
+	withholdServe                                                bool                             // F1 injection: never/late IWANT service
+	withholdDelay                                                time.Duration                    // 0 = silent, >0 = serve whole after delay
+	withheldServes                                               *atomic.Int64                    // verified-exposure counter, may be nil
+	withholdSelect                                               func(mid string) bool            // injection: withhold only the ids the predicate accepts (adversaries.go)
+	withholdPrefix                                               int                              // injection: count-ordered timing, 0 = off
+	withholdPrefixFast                                           bool
+	withholdAsked                                                int
+	hearsay                                                      bool           // injection: re-announce every id heard in IHAVE
+	hearsayWidth                                                 int            // peers per hearsay announcement, 0 = every peer of the topic
+	ihaveObs                                                     *IHaveRPCStats // announce-rate observation (ihaveobs.go); nil when off
+	coalesceControl                                              bool           // fold control-only RPCs into the one already queued (controlcoalesce.go)
+	coalesced                                                    *atomic.Int64
+	peerhaveIHave                                                map[peer.ID]int // of peerhave, the RPCs that carried an IHAVE
+	hearsaid                                                     map[string]struct{}
+	hearsayCtr                                                   *atomic.Int64
+	relaySilent                                                  bool                             // injection: forward nothing received from others
+	relaySkipped                                                 *atomic.Int64                    // messages not forwarded under relay silence
+	idwSpoof                                                     bool                             // injection: claim to hold every id heard in IHAVE
+	idwSpoofed                                                   *atomic.Int64                    // spoofed id claims sent
+	lossClass                                                    uint8                            // F2a injection: which class is shed at admission
+	lossPct                                                      int                              // drop probability, percent
+	lossSeed                                                     uint64                           // per-node seed from the harness
+	lossDropped                                                  *atomic.Int64                    // verified-exposure counter, may be nil
+	phaseHolders                                                 map[string]*phaseHolderEntry     // optional announce-fed holder tracking for phase forwarding
+	rarestFirst                                                  bool                             // order IWANT candidates by known announcers, fewest first
+	rarityDrain                                                  bool                             // order queued normal-lane RPCs by rarity of their data, least-diffused first
+	rarityAnnounce                                               map[string]*phaseHolderEntry     // shared announcer tracking for rarest-first pull and rarity drain
+	rarityHold                                                   map[string]*phaseHolderEntry     // delivered-evidence tracking (IDONTWANT-fed): distinct peers known to HOLD a mid
+	sendingSolicited                                             bool                             // transient: the RPC being sent answers an IWANT and must not be rarity-ranked
+	pullBudgetMax                                                int                              // cap on concurrently outstanding pulled ids; 0 = unbounded
+	pullMemory                                                   bool                             // keep offers the discipline could not act on; re-drive on move-on/refund
+	redriveCtr                                                   *atomic.Int64                    // pull-memory diagnostics: re-driven asks
+	offerTable                                                   map[string]map[peer.ID]time.Time // offer table: unseen id -> announcers and when they offered
+	offerTried                                                   map[string]map[peer.ID]time.Time // asks already spent per id (relap on exhaustion)
+	offerTopic                                                   map[string]string                // id -> topic, for the request gate at retry time
+	offerByPeer                                                  map[peer.ID]int                  // offers recorded per peer, for the per-peer cap
+	offerRetryCtr                                                *atomic.Int64                    // offer-table diagnostics: timer-driven retries sent
+	pullOutstanding                                              map[string]time.Time             // ids pulled and not yet delivered, expiring on the discipline window
+	pullBacklog                                                  []pullCandidate                  // declined candidates (budget or discipline), re-driven as slots free
+	requestGate                                                  RequestGate                      // optional application veto on requesting an announced id
+	deferred                                                     map[string]*deferredEntry        // declined announcements, replayable when the gate opens
+	deferredMax                                                  int                              // cap on deferred entries
+	iasked                                                       map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
+	outbound                                                     map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
+	backoff                                                      map[string]map[peer.ID]time.Time // prune backoff
+	connect                                                      chan connectInfo                 // px connection requests
+	cab                                                          peerstore.AddrBook
 
 	protos  []protocol.ID
 	feature GossipSubFeatureTest
@@ -902,7 +959,26 @@ func (gs *GossipSubRouter) Preprocess(from peer.ID, msgs []*Message) {
 	tmids := make(map[string][]string)
 	for _, msg := range msgs {
 		mid := gs.p.idGen.ID(msg)
+		gs.noteArrival(mid, from)
 		gs.clearIWantBudgetFor(mid)
+		// Bilateral link filter, push side: the bytes are already spent, so the message is
+		// still used — but an UNSOLICITED full message over an inactive mesh link is
+		// attributable, and counted. Solicited data is not a violation: the lazy channel
+		// legitimately invites pulls of inactive-link ids from mesh peers, and a served
+		// IWANT response arrives here exactly like a push would — the discipline's
+		// asked-table is the discriminator (measured: without it, one mid-diffusion
+		// heartbeat produced hundreds of false positives per cell on a compliant network).
+		// Transient mesh asymmetry around GRAFT/PRUNE remains a rare false-positive source;
+		// this stays a counter for attribution, never a punishment.
+		if gs.linkEnforce {
+			if _, inMesh := gs.mesh[msg.GetTopic()][from]; inMesh && !gs.linkFilter(gs.p.host.ID(), from, mid) {
+				if _, asked := gs.iwantAsked[mid]; !asked {
+					if gs.linkViolations != nil {
+						gs.linkViolations.Add(1)
+					}
+				}
+			}
+		}
 		if len(msg.GetData()) < gs.params.IDontWantMessageThreshold {
 			continue
 		}
@@ -929,7 +1005,21 @@ func (gs *GossipSubRouter) Preprocess(from peer.ID, msgs []*Message) {
 
 			// send to only peers that support IDONTWANT
 			if gs.feature(GossipSubFeatureIdontwant, gs.peers[p]) {
-				idontwant := []*pb.ControlIDontWant{{MessageIDs: mids}}
+				sendMids := mids
+				if gs.linkFilter != nil {
+					// Control follows the active links: a peer that will never be pushed
+					// this message over this link has no duplicate to suppress.
+					sendMids = make([]string, 0, len(mids))
+					for _, mid := range mids {
+						if gs.linkFilter(gs.p.host.ID(), p, mid) {
+							sendMids = append(sendMids, mid)
+						}
+					}
+					if len(sendMids) == 0 {
+						continue
+					}
+				}
+				idontwant := []*pb.ControlIDontWant{{MessageIDs: sendMids}}
 				out := rpcWithControl(nil, nil, nil, nil, nil, idontwant)
 				gs.sendRPC(p, out, true)
 			}
@@ -959,10 +1049,31 @@ func (gs *GossipSubRouter) HandleRPC(rpc *RPC) {
 	}
 
 	out := rpcWithControl(iWantResponses, nil, iwant, nil, prune, nil)
+	// Solicited data outranks rarity: an IWANT response is a direct demand signal, and the
+	// rarity drain must never park it behind fresher traffic — a widely-announced message is
+	// widely *offered*, which says nothing about the asker, who by asking proved it lacks
+	// it. Measured before this exemption: the drain under load served background chatter
+	// ahead of requested segments, worsening tails and inflating the server's re-serve load.
+	if len(iWantResponses) > 0 {
+		gs.sendingSolicited = true
+	}
 	gs.sendRPC(rpc.from, out, false)
+	gs.sendingSolicited = false
 }
 
 func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.ControlIWant {
+	// IDONTWANT-spoofing injection: claim to every mesh peer of the topic that this node
+	// holds each id it merely heard announced, and request nothing. Against phase forwarding
+	// the claims inflate the holder count that decays the push budget, suppressing eager
+	// pushes to third parties.
+	if gs.idwSpoof {
+		gs.spoofIDontWant(ctl)
+		return nil
+	}
+	// Hearsay injection: re-announce what was just announced, before deciding whether to ask.
+	if gs.hearsay {
+		gs.hearsayAnnounce(p, ctl)
+	}
 	// we ignore IHAVE gossip from any peer whose score is below the gossip threshold
 	score := gs.score.Score(p)
 	if score < gs.gossipThreshold {
@@ -970,8 +1081,19 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 		return nil
 	}
 
+	// Commitment enforcement: a parked peer's announcements are ineligible for pull
+	// selection until its park expires.
+	if gs.peerParked(p) {
+		return nil
+	}
+
 	// IHAVE flood protection
 	gs.peerhave[p]++
+	// Announce-rate observation, beside the counter the limit reads: peerhave counts every
+	// control-bearing RPC, so record separately the ones that actually carried an IHAVE.
+	if gs.peerhaveIHave != nil && len(ctl.GetIhave()) > 0 {
+		gs.peerhaveIHave[p]++
+	}
 	if gs.peerhave[p] > gs.params.MaxIHaveMessages {
 		gs.logger.Debug("IHAVE: peer has advertised too many times within this heartbeat interval; ignoring", "peer", p, "count", gs.peerhave[p])
 		return nil
@@ -1007,7 +1129,14 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 			if gs.p.seenMessage(mid) {
 				continue
 			}
+			// No link-filter check here, deliberately: since heartbeat gossip serves mesh
+			// peers their inactive-link ids (emitGossip), an IHAVE for an inactive-link id
+			// from a mesh peer is compliant lazy behaviour, and the wire cannot distinguish
+			// it from an immediate announce. Enforcement is confined to the data channel,
+			// where a push over an inactive link is unambiguous.
 			gs.noteAnnouncedHolder(mid, p)
+			gs.noteRarityAnnouncer(mid, p)
+			gs.recordOffer(mid, topic, p)
 			if _, dup := iwant[mid]; dup {
 				continue
 			}
@@ -1031,16 +1160,55 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 		return nil
 	}
 	gs.shuffleStrings(candidates)
+	if gs.rarestFirst {
+		// Balance the pull plane: spend the allowance on the least-announced ids first —
+		// rarest-first over the local announcer estimate, oldest scheduling idea in p2p
+		// distribution. The shuffle above still randomizes order *within* a rarity class,
+		// so a peer cannot steer the order by how it lists its IHAVE; it can only make its
+		// ids look better-diffused (extra announces), never rarer than they are to us.
+		sort.SliceStable(candidates, func(a, b int) bool {
+			return gs.rarityCount(candidates[a]) < gs.rarityCount(candidates[b])
+		})
+	}
+
+	// The pull budget caps concurrently outstanding ids across all peers, so which candidate
+	// gets a slot becomes a real allocation — the scarcity rarest-first needs. Applied after
+	// the sort so both the taken set and the backlog preserve rarity order. Over-budget
+	// candidates go to the backlog and are re-driven the moment a delivery frees a slot:
+	// waiting for an external re-offer was measured to cost the tail a full heartbeat.
+	if gs.pullBudgetMax > 0 {
+		remaining := gs.pullBudgetMax - gs.pullOutstandingLive()
+		if remaining <= 0 {
+			gs.backlogPulls(candidates, iwant, p, nil)
+			return nil
+		}
+		if remaining < allowance {
+			allowance = remaining
+		}
+	}
 
 	iwantlst := gs.selectIWants(candidates, iwant, p, allowance)
 	if len(iwantlst) == 0 {
+		if gs.pullBudgetMax > 0 || gs.pullMemory {
+			gs.backlogPulls(candidates, iwant, p, nil)
+		}
 		return nil
 	}
 
 	gs.logger.Debug("IHAVE: Asking for messages from peer", "asking", len(iwantlst), "candidates", len(candidates), "peer", p)
 	gs.iasked[p] += len(iwantlst)
+	if gs.pullOutstanding != nil {
+		now := time.Now()
+		taken := make(map[string]struct{}, len(iwantlst))
+		for _, mid := range iwantlst {
+			gs.pullOutstanding[mid] = now
+			taken[mid] = struct{}{}
+		}
+		gs.backlogPulls(candidates, iwant, p, taken)
+	}
 
 	gs.gossipTracer.AddPromise(p, iwantlst)
+	gs.noteIWantSent(p, iwantlst)
 	if gs.requestGate != nil {
 		// Only the dispatched set is reported, so an application budget is charged for requests
 		// that were actually made rather than for ids a later policy refused.
@@ -1086,7 +1254,7 @@ func (gs *GossipSubRouter) selectIWants(candidates []string, topicOf map[string]
 			out = append(out, mid)
 			continue
 		}
-		if !gs.iwantAllowed(mid) {
+		if !gs.iwantAllowed(mid, p) {
 			continue
 		}
 		if !gs.iwantBudgetAllowed(mid) {
@@ -1138,13 +1306,14 @@ func (gs *GossipSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb.
 	gs.logger.Debug("IWANT: Sending messages to peer", "messageCount", len(ihave), "peer", p)
 
 	msgs := make([]*pb.Message, 0, len(ihave))
-	for _, msg := range ihave {
+	mids := make([]string, 0, len(ihave))
+	for mid, msg := range ihave {
 		msgs = append(msgs, msg)
+		mids = append(mids, mid)
 	}
 
 	if gs.withholdServe {
-		gs.withholdIWantServe(p, msgs)
-		return nil
+		return gs.withholdIWantServe(p, mids, msgs)
 	}
 
 	return msgs
@@ -1316,6 +1485,13 @@ mainIDWLoop:
 				}
 			}
 			unwanted[computeChecksum(mid)] = gs.params.IDontWantMessageTTL
+			// Group-aware push suppression counts distinct group members a peer has
+			// evidenced; IDONTWANT is that evidence, the same channel the per-message
+			// decay uses.
+			if gs.groupPush != nil {
+				gs.groupPush.note(p, mid)
+			}
+			gs.noteRarityHolder(mid, p)
 		}
 	}
 }
@@ -1524,6 +1700,16 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 		from := msg.ReceivedFrom
 		topic := msg.GetTopic()
 
+		// Relay-silence injection: the node originates its own publishes but forwards
+		// nothing received from others. Announcing (heartbeat IHAVE) and IWANT service are
+		// untouched here — stack WithIWantWithholding for the bait-and-blackhole adversary.
+		if gs.relaySilent && from != gs.p.host.ID() {
+			if gs.relaySkipped != nil {
+				gs.relaySkipped.Add(1)
+			}
+			return
+		}
+
 		// (N,q,g): a message from a peer we asked is a claim->arrival sample for that peer.
 		if gs.nqg != nil {
 			gs.nqgObserve(gs.p.idGen.ID(msg), from)
@@ -1570,10 +1756,17 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 			}
 
 			csum := computeChecksum(gs.p.idGen.ID(msg))
+			fmid := gs.p.idGen.ID(msg)
 			for p := range gmap {
 				// Check if it has already received an IDONTWANT for the message.
 				// If so, don't send it to the peer
 				if _, ok := gs.unwanted[p][csum]; ok {
+					continue
+				}
+				// Per-(message, link) activation: an inactive link carries neither the
+				// push nor the phase announce for this message. Symmetric by contract,
+				// so the peer expects nothing on it either.
+				if gs.linkFilter != nil && !gs.linkFilter(gs.p.host.ID(), p, fmid) {
 					continue
 				}
 				tosend[p] = struct{}{}
@@ -1602,8 +1795,30 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 							// announce is owed.
 							continue
 						}
+						if gs.linkFilter != nil && !gs.linkFilter(gs.p.host.ID(), p, mid) {
+							continue
+						}
 						cand[p] = struct{}{}
 						tosend[p] = struct{}{}
+					}
+				}
+				// Group-aware veto ahead of the budget: a peer evidenced to hold enough of
+				// this message's group completes without it, so pushing buys nothing. It is
+				// announced instead of dropped — evidence approximates, and a peer that is
+				// not actually complete must still be able to pull.
+				var groupVetoed []peer.ID
+				if gs.groupPush != nil {
+					for p := range tosend {
+						if _, inMesh := cand[p]; !inMesh {
+							continue
+						}
+						if gs.groupPush.complete(p, mid) {
+							delete(tosend, p)
+							groupVetoed = append(groupVetoed, p)
+						}
+					}
+					if gs.groupPush.vetoes != nil && len(groupVetoed) > 0 {
+						gs.groupPush.vetoes.Add(int64(len(groupVetoed)))
 					}
 				}
 				fromSelf := from == gs.p.host.ID()
@@ -1614,6 +1829,9 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 					gs.phaseForward.scheduleDeferredIHave(gs, topic, mid, announce)
 					announce = nil
 				}
+				// Vetoed peers get the immediate IHAVE under every source policy: the veto
+				// must never silently withhold.
+				announce = append(announce, groupVetoed...)
 			}
 		}
 
@@ -1860,6 +2078,11 @@ func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC, urgent bool) bool {
 func (gs *GossipSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
 	gs.logger.Debug("dropping message to peer", "peer", p, "reason", reason)
 	gs.tracer.DropRPC(rpc, p)
+	if ctl := rpc.GetControl(); ctl != nil {
+		for _, iw := range ctl.GetIwant() {
+			gs.noteIWantDropped(p, iw.GetMessageIDs())
+		}
+	}
 	// push control messages that need to be retried
 	ctl := rpc.GetControl()
 	if ctl != nil {
@@ -1874,10 +2097,34 @@ func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, urgent bo
 	if rpc = gs.applyClassLoss(rpc, p); rpc == nil {
 		return false
 	}
+	// Sized once, here on the router goroutine, before the first queue sees it: the same RPC
+	// goes to every peer of a publish, and the queues read the size under their own locks.
+	if rpc.size == 0 {
+		rpc.size = proto.Size(&rpc.RPC)
+	}
+	// Control coalescing: fold this RPC into the control-only RPC already waiting for the peer
+	// rather than queue a second one. Only control, only the same lane, only when something is
+	// already waiting — an idle link is untouched.
+	if gs.coalesceControl && controlOnly(rpc) {
+		if _, ok := q.coalesceInto(rpc, urgent, gs.p.maxMessageSize, gs.p.maxControlMessageSize); ok {
+			if gs.coalesced != nil {
+				gs.coalesced.Add(1)
+			}
+			gs.tracer.SendRPC(rpc, p)
+			return true
+		}
+	}
 	var err error
-	if urgent {
+	switch {
+	case urgent:
 		err = q.UrgentPush(rpc, false)
-	} else {
+	case gs.rarityDrain:
+		rank := 0
+		if !gs.sendingSolicited {
+			rank = gs.drainRank(rpc)
+		}
+		err = q.RankedPush(rpc, rank, false)
+	default:
 		err = q.Push(rpc, false)
 	}
 	if err != nil {
@@ -2181,23 +2428,6 @@ func (gs *GossipSubRouter) heartbeat() {
 		gs.emitGossip(topic, peers)
 	}
 
-	// Gossip topics that hold registered (advertisement-only) partial-message state without
-	// being in the mesh or the fanout: a joined-but-unsubscribed contributor
-	// (partialmessages.RegisterPartial) is in neither, and this is the only path that ever
-	// announces its state. The message cache has nothing for such a topic, so emitGossip
-	// sends no IHAVE and only the partial-messages extension's gossip runs.
-	if gs.extensions.partialMessagesExtension != nil {
-		for _, topic := range gs.extensions.partialMessagesExtension.RegisteredTopics() {
-			if _, inMesh := gs.mesh[topic]; inMesh {
-				continue
-			}
-			if _, inFanout := gs.fanout[topic]; inFanout {
-				continue
-			}
-			gs.emitGossip(topic, nil)
-		}
-	}
-
 	// send coalesced GRAFT/PRUNE messages (will piggyback gossip)
 	gs.sendGraftPrune(tograft, toprune, noPX)
 
@@ -2211,6 +2441,16 @@ func (gs *GossipSubRouter) heartbeat() {
 }
 
 func (gs *GossipSubRouter) clearIHaveCounters() {
+	// Fold the heartbeat's counts into the observation before they are thrown away: one sample
+	// per (peer, heartbeat) pair, which is exactly the quantity MaxIHaveMessages is compared to.
+	if gs.ihaveObs != nil {
+		for p, n := range gs.peerhave {
+			gs.ihaveObs.observe(n, gs.peerhaveIHave[p])
+		}
+		if len(gs.peerhaveIHave) > 0 {
+			gs.peerhaveIHave = make(map[peer.ID]int)
+		}
+	}
 	if len(gs.peerhave) > 0 {
 		// throw away the old map and make a new one
 		gs.peerhave = make(map[peer.ID]int)
@@ -2345,7 +2585,16 @@ func (gs *GossipSubRouter) emitGossip(topic string, exclude map[peer.ID]struct{}
 		_, inExclude := exclude[p]
 		_, direct := gs.direct[p]
 
-		if !inExclude && !direct && gs.feature(GossipSubFeatureMesh, gs.peers[p]) && gs.score.Score(p) >= gs.gossipThreshold {
+		// The exclude set is the mesh, and its justification is that mesh peers were already
+		// served eagerly. Under a link filter that is only true per link: a mesh peer's
+		// inactive links carried neither the push nor the immediate IHAVE, so those ids are
+		// owed the lazy channel like any non-mesh peer's. Mesh members therefore stay
+		// gossip-eligible when a filter is installed; the emission below restricts their id
+		// lists to inactive-link ids they have not already evidenced holding.
+		if inExclude && gs.linkFilter == nil {
+			continue
+		}
+		if !direct && gs.feature(GossipSubFeatureMesh, gs.peers[p]) && gs.score.Score(p) >= gs.gossipThreshold {
 			peers = append(peers, p)
 		}
 	}
@@ -2387,6 +2636,29 @@ func (gs *GossipSubRouter) emitGossip(topic string, exclude map[peer.ID]struct{}
 
 		for _, p := range peers {
 			peerMids := mids
+			if _, inMesh := exclude[p]; inMesh && gs.linkFilter != nil {
+				// A mesh peer's lazy list is the complement of what it was eagerly offered:
+				// inactive-link ids only, minus what it has already IDONTWANTed to us.
+				peerMids = make([]string, 0, len(mids))
+				for _, mid := range mids {
+					if gs.linkFilter(gs.p.host.ID(), p, mid) {
+						continue
+					}
+					if _, held := gs.unwanted[p][computeChecksum(mid)]; held {
+						continue
+					}
+					peerMids = append(peerMids, mid)
+				}
+				if len(peerMids) == 0 {
+					continue
+				}
+				if len(peerMids) > gs.params.MaxIHaveLength {
+					gs.shuffleStrings(peerMids)
+					peerMids = peerMids[:gs.params.MaxIHaveLength]
+				}
+				gs.enqueueGossip(p, &pb.ControlIHave{TopicID: &topic, MessageIDs: peerMids})
+				continue
+			}
 			if len(mids) > gs.params.MaxIHaveLength {
 				// we do this per peer so that we emit a different set for each peer.
 				// we have enough redundancy in the system that this will significantly increase the message

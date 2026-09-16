@@ -191,6 +191,8 @@ type PubSub struct {
 	// normal doDropRPC path -- real queue pressure from a slow drain, not a probabilistic
 	// strip (that is F2a). Models a node whose send path cannot keep up.
 	sendDelay time.Duration
+	// readDelay, when set (E7 slow-reader injection), elapses before each inbound read.
+	readDelay time.Duration
 
 	inboundStreamsMx sync.Mutex
 	inboundStreams   map[peer.ID]inboundHandler
@@ -328,6 +330,8 @@ type RPC struct {
 
 	// unexported on purpose, not sending this over the wire
 	from peer.ID
+	// wire size, set by the router before the RPC enters an outbound queue (queue accounting)
+	size int
 }
 
 func (rpc *RPC) From() peer.ID {
@@ -1232,15 +1236,6 @@ func (p *PubSub) handleRemoveTopic(req *rmTopicReq) {
 	if len(topic.evtHandlers) == 0 &&
 		len(p.mySubs[req.topic.topic]) == 0 &&
 		p.myRelays[req.topic.topic] == 0 {
-		// Withdraw partial interest with the topic. Without this, peers keep treating the
-		// node as a valid partial-message recipient on a topic it has left, and the
-		// myPartialInterest entry outlives the topic (announced again in the hello packet of
-		// every new stream, resurrecting interest the application withdrew by closing).
-		if p.myPartialInterest[topic.topic] {
-			if err := p.announcePartialInterest(topic.topic, false); err != nil {
-				p.logger.Info("Can't withdraw partial interest on topic close", "topic", topic.topic, "err", err)
-			}
-		}
 		delete(p.myTopics, topic.topic)
 		req.resp <- nil
 		return
@@ -1781,6 +1776,9 @@ func (p *PubSub) shouldPush(msg *Message) bool {
 	id := p.idGen.ID(msg)
 	if p.seenMessage(id) {
 		p.tracer.DuplicateMessage(msg)
+		if gs, ok := p.rt.(*GossipSubRouter); ok {
+			gs.noteDuplicate(id, src)
+		}
 		return false
 	}
 

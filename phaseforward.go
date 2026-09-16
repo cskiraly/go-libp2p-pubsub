@@ -51,6 +51,52 @@ type phaseForwarding struct {
 	// known-holders decay undercounts and the push degree stays near r.
 	meshless      bool
 	announceWidth int
+
+	// Selection policy for the pushed subset (design-space §13 nomenclature). Default is
+	// sel=rank: the per-(message, peer) hash, blind to need with no floor on a receiver's
+	// per-segment push in-degree. sel=rr rotates a deterministic peer order by a per-router
+	// message counter instead: each mesh peer receives a fair, deterministic share of this
+	// sender's pushes across messages, at the price of predictability.
+	selRR bool
+	rrCtr atomic.Uint64
+
+	// Fixed budget switches the phase transition off and keeps only the split: push to at
+	// most degree of the mesh peers not known to hold the message and announce to the rest,
+	// without the known-holder count shrinking the push. Isolates the announce-instead-of-
+	// push half of phase forwarding from the estimator half.
+	fixedBudget bool
+}
+
+// WithPhaseFixedBudget keeps phase forwarding's split (push r, announce the rest) but drops
+// the IDONTWANT-driven decay of the push budget. Requires WithPhaseForwarding.
+func WithPhaseFixedBudget() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("fixed phase budget requires a gossipsub router")
+		}
+		if gs.phaseForward == nil {
+			return fmt.Errorf("fixed phase budget requires WithPhaseForwarding first")
+		}
+		gs.phaseForward.fixedBudget = true
+		return nil
+	}
+}
+
+// WithPhaseSelectRR switches phase forwarding's push-target selection from the per-message
+// hash rank (sel=rank) to sender-side round-robin (sel=rr). Requires WithPhaseForwarding.
+func WithPhaseSelectRR() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("phase selection requires a gossipsub router")
+		}
+		if gs.phaseForward == nil {
+			return fmt.Errorf("phase selection requires WithPhaseForwarding first")
+		}
+		gs.phaseForward.selRR = true
+		return nil
+	}
 }
 
 // WithPhaseMeshless widens phase forwarding's candidate set from the topic mesh to every
@@ -152,11 +198,13 @@ func WithPhaseForwarding(match func(topic string) bool, degree int) Option {
 // narrows or defers the returned announce list per srcMode.
 func (pf *phaseForwarding) trim(gs *GossipSubRouter, mid string, csum checksum, gmap map[peer.ID]struct{}, tosend map[peer.ID]struct{}, fromSelf bool) []peer.ID {
 	holders := 0
-	for p := range gmap {
-		if _, ok := gs.unwanted[p][csum]; ok {
-			holders++
-		} else if gs.announcedHolder(mid, p) {
-			holders++
+	if !pf.fixedBudget {
+		for p := range gmap {
+			if _, ok := gs.unwanted[p][csum]; ok {
+				holders++
+			} else if gs.announcedHolder(mid, p) {
+				holders++
+			}
 		}
 	}
 	degree := pf.degree
@@ -176,15 +224,26 @@ func (pf *phaseForwarding) trim(gs *GossipSubRouter, mid string, csum checksum, 
 	if budget >= len(cands) {
 		return nil
 	}
-	// Rank per (message, peer) so different messages spread their pushes across different
-	// peers, and the choice is stable rather than map-order dependent.
-	sort.Slice(cands, func(i, j int) bool {
-		ri, rj := phaseRank(mid, cands[i]), phaseRank(mid, cands[j])
-		if ri != rj {
-			return ri > rj
-		}
-		return cands[i] > cands[j]
-	})
+	if pf.selRR {
+		// sel=rr: deterministic peer order rotated by a per-router message counter, so each
+		// mesh peer gets a fair share of this sender's pushes across messages. Senders do not
+		// coordinate, so per-segment coverage across a receiver's neighbors remains
+		// probabilistic — the same (1-r/D)^h expectation as sel=rank, minus the within-sender
+		// binomial variance.
+		sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
+		k := int((pf.rrCtr.Add(1) - 1) % uint64(len(cands)))
+		cands = append(cands[k:], cands[:k]...)
+	} else {
+		// sel=rank: per (message, peer) hash so different messages spread their pushes across
+		// different peers, and the choice is stable rather than map-order dependent.
+		sort.Slice(cands, func(i, j int) bool {
+			ri, rj := phaseRank(mid, cands[i]), phaseRank(mid, cands[j])
+			if ri != rj {
+				return ri > rj
+			}
+			return cands[i] > cands[j]
+		})
+	}
 	announce := make([]peer.ID, 0, len(cands)-budget)
 	for _, p := range cands[budget:] {
 		delete(tosend, p)
@@ -269,26 +328,58 @@ func WithIWantWithholding(delay time.Duration, withheld *atomic.Int64) Option {
 	}
 }
 
-// withholdIWantServe applies the injection to a built reply: swallow it (silent) or send
-// it whole after the delay, on pubsub's own goroutine like every router action.
-func (gs *GossipSubRouter) withholdIWantServe(p peer.ID, msgs []*pb.Message) {
-	if gs.withheldServes != nil {
-		gs.withheldServes.Add(int64(len(msgs)))
-	}
-	if gs.withholdDelay <= 0 {
-		return
-	}
-	time.AfterFunc(gs.withholdDelay, func() {
-		select {
-		case gs.p.eval <- func() {
-			if _, ok := gs.p.peers[p]; !ok {
-				return
-			}
-			gs.sendRPC(p, rpcWithControl(msgs, nil, nil, nil, nil, nil), false)
-		}:
-		case <-gs.p.ctx.Done():
+// WithRelaySilence makes this node forward nothing it receives from others: the fan-out for
+// relayed messages yields no recipients. Own publishes, announcements and IWANT service are
+// untouched; stack WithIWantWithholding for the bait-and-blackhole adversary, under which
+// push supply through adversarial nodes disappears and the phi^D exposure arithmetic applies.
+func WithRelaySilence(skipped *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("relay silence requires a gossipsub router")
 		}
-	})
+		gs.relaySilent = true
+		gs.relaySkipped = skipped
+		return nil
+	}
+}
+
+// WithIDontWantSpoofing makes this node answer every IHAVE by claiming, to all mesh peers of
+// the announced topic, that it already holds the announced ids — and by requesting nothing.
+// The claims are wire-legal IDONTWANTs for messages the node does not hold; against phase
+// forwarding they inflate the holder count that decays the push budget.
+func WithIDontWantSpoofing(spoofed *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("idontwant spoofing requires a gossipsub router")
+		}
+		gs.idwSpoof = true
+		gs.idwSpoofed = spoofed
+		return nil
+	}
+}
+
+// spoofIDontWant sends an IDONTWANT for every announced id to every mesh peer of the
+// announcement's topic that supports the feature.
+func (gs *GossipSubRouter) spoofIDontWant(ctl *pb.ControlMessage) {
+	for _, e := range ctl.GetIhave() {
+		topic := e.GetTopicID()
+		ids := e.GetMessageIDs()
+		if len(ids) == 0 {
+			continue
+		}
+		for p2 := range gs.mesh[topic] {
+			if !gs.feature(GossipSubFeatureIdontwant, gs.peers[p2]) {
+				continue
+			}
+			idontwant := []*pb.ControlIDontWant{{MessageIDs: ids}}
+			gs.sendRPC(p2, rpcWithControl(nil, nil, nil, nil, nil, idontwant), true)
+			if gs.idwSpoofed != nil {
+				gs.idwSpoofed.Add(int64(len(ids)))
+			}
+		}
+	}
 }
 
 // --- F2a per-class admission loss (measurement-plan section 15) ---
@@ -547,6 +638,126 @@ func WithIWantHedge(after time.Duration) Option {
 	}
 }
 
+// WithIWantTailHedge is "ask k, take the first" restricted to the tail: once EnterTailHedge has
+// been called (the application knows it is within a few segments of completing the group), the
+// discipline permits up to k outstanding IWANTs per id, issued immediately to distinct
+// announcers, instead of one. The duplicate bytes are bounded by (k - 1) times the ids still
+// missing at that point, whatever the payload size, and are spent where the tail lives. On entry
+// the ids already in flight are hedged from the offer table (untried announcers first); after
+// entry, a fresh IHAVE for an outstanding id is answered up to the cap. Requires the discipline;
+// the offer table is what makes entry proactive. Single-group form (one tail flag per router),
+// like the harness's stop-pull; a production form keeps the flag per group.
+func WithIWantTailHedge(k int, extra *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("tail hedge requires a gossipsub router")
+		}
+		if k < 2 {
+			return fmt.Errorf("tail hedge fanout must be at least 2")
+		}
+		gs.tailK = k
+		gs.tailExtraCtr = extra
+		gs.tailAsks = make(map[string]int)
+		gs.tailPeerExtra = make(map[peer.ID]int)
+		if gs.iwantCount == nil {
+			gs.iwantCount = make(map[string]int)
+		}
+		return nil
+	}
+}
+
+// EnterTailHedge tells the router that this node is in the tail of the group it is receiving.
+// Safe from any goroutine; the state change and the proactive hedging run on the router's.
+func (p *PubSub) EnterTailHedge() {
+	gs, ok := p.rt.(*GossipSubRouter)
+	if !ok || gs.tailK == 0 {
+		return
+	}
+	select {
+	case p.eval <- func() { gs.enterTail() }:
+	case <-p.ctx.Done():
+	}
+}
+
+// enterTail runs on the router goroutine: flips the flag and hedges the asks already in flight
+// from the offer table, up to the fan-out, untried announcers first in deterministic peer order
+// (tailTopUp: oldest asks first, and no more ids than the deficit when it is known).
+func (gs *GossipSubRouter) enterTail() {
+	gs.tailOn = true
+	gs.tailTopUp(nil)
+}
+
+// tailHedgeMid issues extra IWANTs for an outstanding id until the effective fan-out are in
+// flight, each to an announcer not yet asked for it, within the bounds; honours parks and the
+// request gate like every other pull. Returns the asks issued.
+func (gs *GossipSubRouter) tailHedgeMid(mid string) int {
+	issued := 0
+	tried := gs.offerTried[mid]
+	cands := make([]peer.ID, 0, len(gs.offerTable[mid]))
+	for p := range gs.offerTable[mid] {
+		if _, was := tried[p]; was {
+			continue
+		}
+		if gs.peerParked(p) {
+			continue
+		}
+		if gs.requestGate != nil && !gs.requestGate.Allow(p, gs.offerTopic[mid], mid) {
+			continue
+		}
+		cands = append(cands, p)
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
+	for _, pick := range cands {
+		if gs.iwantCount[mid] >= gs.tailKNow() {
+			return issued
+		}
+		if !gs.tailExtraAllowed(mid, pick) {
+			return issued
+		}
+		issued++
+		gs.iwantCount[mid]++
+		gs.noteAsk(mid, pick)
+		if gs.tailExtraCtr != nil {
+			gs.tailExtraCtr.Add(1)
+		}
+		gs.iasked[pick]++
+		gs.gossipTracer.AddPromise(pick, []string{mid})
+		gs.noteIWantSent(pick, []string{mid})
+		if gs.requestGate != nil {
+			gs.requestGate.Committed(pick, []string{mid})
+		}
+		gs.sendRPC(pick, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{mid}}}, nil, nil, nil), false)
+	}
+	return issued
+}
+
+// noteAsk records an ask of mid to from for the offer table (so a retry does not re-ask the same
+// peer) and opens its promise for the park, when those are on. The first ask's retry timer is not
+// armed here: it belongs to the id, not the peer.
+func (gs *GossipSubRouter) noteAsk(mid string, from peer.ID) {
+	if gs.offerTable != nil {
+		if gs.offerTried[mid] == nil {
+			gs.offerTried[mid] = make(map[peer.ID]time.Time)
+		}
+		gs.offerTried[mid][from] = time.Now()
+	}
+	if gs.iwantPromised != nil {
+		if gs.iwantPromised[mid] == nil {
+			gs.iwantPromised[mid] = make(map[peer.ID]time.Time)
+		}
+		askedAt := time.Now()
+		gs.iwantPromised[mid][from] = askedAt
+		m, f := mid, from
+		time.AfterFunc(gs.parkPromise, func() {
+			select {
+			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt) }:
+			case <-gs.p.ctx.Done():
+			}
+		})
+	}
+}
+
 // --- Deterministic randomness (common-random-numbers mode for the harness) ---
 //
 // Gossipsub's mesh draw runs the global math/rand over map-iteration-ordered candidate
@@ -582,8 +793,19 @@ func (gs *GossipSubRouter) shufflePeers(peers []peer.ID) {
 		shufflePeers(peers)
 		return
 	}
+	// Compute each key once. stablePeerKey is an address-book lookup, and calling it inside the
+	// comparator made the sort O(n log n) lookups per shuffle; the heartbeat runs a shuffle per
+	// topic, so at 64 topics on a 500-node mesh one topology spent two wall-clock hours in this
+	// sort without ever settling (experiments Q77, seed 13). Same keys, same order, so every
+	// deterministic-rand cell keeps its outcome.
+	keys := make(map[peer.ID]string, len(peers))
+	for _, p := range peers {
+		if _, ok := keys[p]; !ok {
+			keys[p] = gs.stablePeerKey(p)
+		}
+	}
 	sort.Slice(peers, func(i, j int) bool {
-		return gs.stablePeerKey(peers[i]) < gs.stablePeerKey(peers[j])
+		return keys[peers[i]] < keys[peers[j]]
 	})
 	for i := range peers {
 		j := gs.rng.Intn(i + 1)
@@ -960,21 +1182,52 @@ func (gs *GossipSubRouter) resetIWantBudget() {
 	}
 }
 
-// clearIWantBudgetFor drops the id on message arrival (PR 625's Preprocess delete).
+// clearIWantBudgetFor drops the id on message arrival (PR 625's Preprocess delete). The pull
+// budget's outstanding entry clears here too: delivery is what frees a slot.
 func (gs *GossipSubRouter) clearIWantBudgetFor(mid string) {
 	if gs.iwantBudget != nil {
 		delete(gs.iwantBudget, mid)
 	}
+	// Delivery keeps the promise: the asked peer served within the window, so the later
+	// expiry of the iwantAsked entry (which delivery deliberately does not clear) must not
+	// count as a break. Without this line every honest serve would eventually park its
+	// server, because iwantAsked entries age out rather than clearing on arrival.
+	if gs.iwantPromised != nil {
+		delete(gs.iwantPromised, mid)
+	}
+	if gs.pullOutstanding != nil {
+		delete(gs.pullOutstanding, mid)
+		gs.redrivePulls()
+	}
+	gs.clearOffers(mid)
 }
 
 // iwantAllowed reports whether an IWANT for mid may be issued now, recording it if so.
 // Runs on pubsub's goroutine, like every router map.
-func (gs *GossipSubRouter) iwantAllowed(mid string) bool {
+func (gs *GossipSubRouter) iwantAllowed(mid string, from peer.ID) bool {
 	if gs.iwantAsked == nil {
 		return true
 	}
 	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
 		elapsed := time.Since(at)
+		// Tail hedge: in the tail, a fresh announcer of an outstanding id is asked at once, up
+		// to the cap, never the same peer twice.
+		if gs.tailOn && gs.tailK > 0 && gs.iwantCount[mid] < gs.tailKNow() {
+			if tried := gs.offerTried[mid]; tried != nil {
+				if _, was := tried[from]; was {
+					return false
+				}
+			}
+			if !gs.tailExtraAllowed(mid, from) {
+				return false
+			}
+			gs.iwantCount[mid]++
+			gs.noteAsk(mid, from)
+			if gs.tailExtraCtr != nil {
+				gs.tailExtraCtr.Add(1)
+			}
+			return true
+		}
 		// Adaptive hedge (two-controller form) takes precedence over the fixed one.
 		if gs.adaptHedge != nil {
 			return gs.hedgeAllowedAdaptive(mid, elapsed)
@@ -992,6 +1245,106 @@ func (gs *GossipSubRouter) iwantAllowed(mid string) bool {
 	if gs.iwantCount != nil {
 		gs.iwantCount[mid] = 1
 	}
+	if gs.offerTable != nil {
+		if gs.offerTried[mid] == nil {
+			gs.offerTried[mid] = make(map[peer.ID]time.Time)
+		}
+		gs.offerTried[mid][from] = time.Now()
+		m := mid
+		time.AfterFunc(gs.iwantWindow+5*time.Millisecond, func() {
+			select {
+			case gs.p.eval <- func() { gs.retryOfferedPull(m) }:
+			case <-gs.p.ctx.Done():
+			}
+		})
+	}
+	if gs.iwantPromised != nil {
+		// Two-timer design: the promise is per (id, peer) and survives the discipline's
+		// move-on, so a fast window re-asks elsewhere while the slow/withholding peer's
+		// own deadline (parkPromise, which may exceed the window) still runs to judgment.
+		// Delivery of the id from anyone absolves every open promise for it.
+		if gs.iwantPromised[mid] == nil {
+			gs.iwantPromised[mid] = make(map[peer.ID]time.Time)
+		}
+		askedAt := gs.iwantAsked[mid]
+		gs.iwantPromised[mid][from] = askedAt
+		m, f := mid, from
+		time.AfterFunc(gs.parkPromise, func() {
+			select {
+			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt) }:
+			case <-gs.p.ctx.Done():
+			}
+		})
+	}
+	return true
+}
+
+// promiseDue runs on the router goroutine at this peer's promise deadline. A promise already
+// cleared (delivery of the id, from anyone) or re-made (a newer ask to the same peer) is not
+// charged; an open one breaks: the asked peer is charged and possibly parked. The discipline
+// slot is refunded only when this ask is still the current one (a shorter window has usually
+// moved on already — then there is nothing left to refund).
+func (gs *GossipSubRouter) promiseDue(mid string, from peer.ID, askedAt time.Time) {
+	if gs.iwantPromised == nil {
+		return
+	}
+	peers := gs.iwantPromised[mid]
+	if at, open := peers[from]; !open || !at.Equal(askedAt) {
+		return
+	}
+	gs.notePromiseBreak(mid, from)
+	if at, ok := gs.iwantAsked[mid]; ok && at.Equal(askedAt) {
+		delete(gs.iwantAsked, mid)
+		if gs.iwantCount != nil {
+			delete(gs.iwantCount, mid)
+		}
+		if gs.pullOutstanding != nil {
+			delete(gs.pullOutstanding, mid)
+			gs.redrivePulls()
+		}
+	}
+}
+
+// notePromiseBreak charges peer p for an unserved ask of mid (its promise deadline elapsed
+// undelivered), parking it once its breaks reach parkK. No-op when enforcement is off.
+func (gs *GossipSubRouter) notePromiseBreak(mid string, p peer.ID) {
+	if gs.iwantPromised == nil {
+		return
+	}
+	if peers := gs.iwantPromised[mid]; peers != nil {
+		delete(peers, p)
+		if len(peers) == 0 {
+			delete(gs.iwantPromised, mid)
+		}
+	}
+	gs.parkBreaks[p]++
+	if gs.parkBreaksCtr != nil {
+		gs.parkBreaksCtr.Add(1)
+	}
+	if gs.parkBreaks[p] >= gs.parkK {
+		if _, already := gs.parkedUntil[p]; !already {
+			if gs.parksCtr != nil {
+				gs.parksCtr.Add(1)
+			}
+		}
+		gs.parkedUntil[p] = time.Now().Add(gs.parkTTL)
+	}
+}
+
+// peerParked reports whether a peer's announcements are currently ineligible for pull
+// selection under commitment enforcement. Expired parks clear lazily.
+func (gs *GossipSubRouter) peerParked(p peer.ID) bool {
+	if gs.parkedUntil == nil {
+		return false
+	}
+	until, ok := gs.parkedUntil[p]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(gs.parkedUntil, p)
+		return false
+	}
 	return true
 }
 
@@ -1002,11 +1355,49 @@ func (gs *GossipSubRouter) clearIWantAsked() {
 	}
 	for mid, at := range gs.iwantAsked {
 		if time.Since(at) >= gs.iwantWindow {
+			// Two-timer enforcement: expiry here just moves the discipline on; any open
+			// promise keeps running to its own deadline (promiseDue charges it there).
 			delete(gs.iwantAsked, mid)
 			if gs.iwantCount != nil {
 				delete(gs.iwantCount, mid)
 			}
 		}
+	}
+	// With pull memory, freed windows re-ask remembered announcers instead of waiting
+	// for a fresh offer that may never come (relays announce once).
+	gs.redrivePulls()
+	gs.sweepOffers()
+}
+
+// WithIHaveCommitmentPark treats an IHAVE as a binding offer under the IWANT discipline:
+// each ask opens a per-(id, peer) promise with its own deadline; a promise still unserved at
+// the deadline is a break, and a peer reaching k breaks is parked — its announcements
+// ineligible for pull selection — for ttl. Delivery of the id (from anyone) absolves every
+// open promise for it. The promise deadline is independent of the discipline window (v3,
+// two-timer): a short window moves on and re-asks elsewhere while slow peers still run to
+// judgment. Requires WithIWantDiscipline first. Park gates pull selection only; pushes,
+// scoring and holder evidence are untouched.
+func WithIHaveCommitmentPark(k int, promise, ttl time.Duration, breaks, parks *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("commitment park requires a gossipsub router")
+		}
+		if gs.iwantAsked == nil {
+			return fmt.Errorf("commitment park requires WithIWantDiscipline first")
+		}
+		if k < 1 || ttl <= 0 || promise <= 0 {
+			return fmt.Errorf("commitment park needs k >= 1, a positive ttl, and a positive promise")
+		}
+		gs.parkPromise = promise
+		gs.iwantPromised = make(map[string]map[peer.ID]time.Time)
+		gs.parkBreaks = make(map[peer.ID]int)
+		gs.parkedUntil = make(map[peer.ID]time.Time)
+		gs.parkK = k
+		gs.parkTTL = ttl
+		gs.parkBreaksCtr = breaks
+		gs.parksCtr = parks
+		return nil
 	}
 }
 
@@ -1017,6 +1408,130 @@ func (gs *GossipSubRouter) clearIWantAsked() {
 // registered as holders, so the decay never fired. Announces are the wider signal: a peer
 // that sent us an IHAVE for a message id holds it. Opt-in, because it changes the measured
 // behaviour of the existing phase arms.
+
+// Group-aware push suppression: the sender-side half of the coded-group byte-suppression
+// design (the receiver-side half is the application's stop-pull request gate). Messages that
+// belong to a group where any `need` distinct members complete a receiver — erasure-coded
+// segment groups — stop being pushed to a peer once that peer has evidenced `need` distinct
+// members, and are announced to it instead. Evidence is IDONTWANT-fed, the same channel the
+// per-message decay uses, with the same v1 limitation: only mesh peers emit it.
+//
+// Storage is prototype-grade: per (peer, group) distinct-mid sets, unpruned, sized for a
+// measurement cell rather than a long-lived node. Runs entirely on the router's event loop,
+// so it takes no locks, like the phaseHolders tracking above.
+type groupPush struct {
+	extract func(mid string) (string, bool)
+	need    int
+	held    map[peer.ID]map[string]map[string]struct{}
+	vetoes  *atomic.Int64 // optional, application-supplied; counts (message, peer) push vetoes
+}
+
+// note records that p evidenced holding mid.
+func (g *groupPush) note(p peer.ID, mid string) {
+	key, ok := g.extract(mid)
+	if !ok {
+		return
+	}
+	byGroup, ok := g.held[p]
+	if !ok {
+		byGroup = make(map[string]map[string]struct{})
+		g.held[p] = byGroup
+	}
+	mids, ok := byGroup[key]
+	if !ok {
+		mids = make(map[string]struct{})
+		byGroup[key] = mids
+	}
+	mids[mid] = struct{}{}
+}
+
+// complete reports whether p has evidenced enough distinct members of mid's group to
+// complete without mid.
+func (g *groupPush) complete(p peer.ID, mid string) bool {
+	key, ok := g.extract(mid)
+	if !ok {
+		return false
+	}
+	return len(g.held[p][key]) >= g.need
+}
+
+// WithGroupCompletionPush stops pushing group members to peers evidenced to hold at least
+// `need` distinct members of the same group, announcing to them instead. extract derives a
+// group key from a message id, ok=false for ids that carry none — those are never vetoed.
+// vetoes, if non-nil, is incremented once per suppressed (message, peer) push. Requires
+// WithPhaseForwarding: the veto rides the phase path's announce machinery.
+func WithGroupCompletionPush(extract func(mid string) (string, bool), need int, vetoes *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("group completion push requires a gossipsub router")
+		}
+		if gs.phaseForward == nil {
+			return fmt.Errorf("group completion push requires WithPhaseForwarding first")
+		}
+		if extract == nil || need <= 0 {
+			return fmt.Errorf("group completion push requires an extractor and need > 0")
+		}
+		gs.groupPush = &groupPush{
+			extract: extract,
+			need:    need,
+			held:    make(map[peer.ID]map[string]map[string]struct{}),
+			vetoes:  vetoes,
+		}
+		return nil
+	}
+}
+
+// WithMessageLinkFilter installs a per-(message, link) activation predicate on the eager
+// path: a mesh link that is inactive for a message carries neither the push, nor the phase
+// announce, nor the IDONTWANT for it. The predicate must be symmetric — both endpoints
+// compute the same answer from the unordered peer pair and the message id — so each message
+// diffuses over a deterministic subgraph of the mesh that both sides agree on, and a wide
+// mesh yields per-message topologies of smaller expected degree with disjoint path sets.
+//
+// The lazy channel follows the complement: heartbeat gossip, which normally excludes mesh
+// peers because they were served eagerly, includes them under a filter — restricted to their
+// inactive-link ids — since for those ids the eager service never happened. Non-mesh gossip
+// and IWANT serving are unchanged, so a node isolated in one message's subgraph can still
+// pull it. Non-message traffic never reaches the predicate.
+func WithMessageLinkFilter(filter func(local, remote peer.ID, mid string) bool) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("message link filter requires a gossipsub router")
+		}
+		if filter == nil {
+			return fmt.Errorf("message link filter requires a non-nil predicate")
+		}
+		gs.linkFilter = filter
+		return nil
+	}
+}
+
+// WithMessageLinkFilterEnforcement makes the link filter bilateral on the data channel. The
+// predicate is deterministic and symmetric, so a receiver can verify inbound traffic against
+// it — but only where the channel is unambiguous: an *unsolicited* full message over an
+// inactive mesh link is a violation, counted (its bytes are already spent, so it is still
+// used) with the sender attributable. Data whose id sits in the IWANT discipline's
+// asked-table is solicited — a served pull of a lazily announced id — and never counted.
+// Announcements are deliberately not checked: heartbeat gossip
+// legitimately carries inactive-link ids to mesh peers (see WithMessageLinkFilter), and the
+// wire cannot distinguish lazy from immediate IHAVEs. violations, if non-nil, is incremented
+// once per violating push. Requires WithMessageLinkFilter first.
+func WithMessageLinkFilterEnforcement(violations *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("link filter enforcement requires a gossipsub router")
+		}
+		if gs.linkFilter == nil {
+			return fmt.Errorf("link filter enforcement requires WithMessageLinkFilter first")
+		}
+		gs.linkEnforce = true
+		gs.linkViolations = violations
+		return nil
+	}
+}
 
 // WithPhaseAnnounceHolders feeds received IHAVEs into phase forwarding's holder estimate.
 func WithPhaseAnnounceHolders() Option {
@@ -1066,17 +1581,454 @@ func (gs *GossipSubRouter) announcedHolder(mid string, p peer.ID) bool {
 }
 
 // clearPhaseHolders drops holder entries older than the retention window; called from the
-// heartbeat. Six heartbeats matches the mcache history a message stays serveable for.
+// heartbeat. Six heartbeats matches the mcache history a message stays serveable for. The
+// rarest-first announcer table follows the same retention.
 func (gs *GossipSubRouter) clearPhaseHolders() {
-	if gs.phaseHolders == nil {
-		return
-	}
 	cutoff := 6 * gs.params.HeartbeatInterval
 	for mid, e := range gs.phaseHolders {
 		if time.Since(e.added) >= cutoff {
 			delete(gs.phaseHolders, mid)
 		}
 	}
+	for mid, e := range gs.rarityAnnounce {
+		if time.Since(e.added) >= cutoff {
+			delete(gs.rarityAnnounce, mid)
+		}
+	}
+	for mid, e := range gs.rarityHold {
+		if time.Since(e.added) >= cutoff {
+			delete(gs.rarityHold, mid)
+		}
+	}
+}
+
+// WithRarestFirstPull orders each IHAVE's pull candidates by how many distinct peers have
+// announced them, fewest first — rarest-first chunk scheduling on the pull plane. The eager
+// wavefront (pushes) is untouched: pulls happen where segment diffusions already collide in a
+// node's schedule, which is exactly where balancing belongs. Rarity comes from a dedicated
+// announcer table rather than the phase decay's holder estimate, so enabling this changes pull
+// order and nothing else.
+func WithRarestFirstPull() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("rarest-first pull requires a gossipsub router")
+		}
+		gs.rarestFirst = true
+		gs.rarityAnnounce = make(map[string]*phaseHolderEntry)
+		return nil
+	}
+}
+
+// WithRarityOrderedDrain orders each peer's queued normal-lane RPCs by the rarity of their
+// data, least-diffused first — sender-side rarest-first, at the plane where the uplink
+// actually binds. Rank 0 (control flushes, non-data) drains ahead; a data RPC ranks 1 plus
+// the fewest known announcers among its messages. The rank is stamped at enqueue on the event
+// loop, where the rarity table lives, and may go stale while queued — bounded by queue
+// residence time. With an empty or single-entry queue the drain is exact FIFO, so the
+// uncontended wavefront is untouched by construction: the queue's own occupancy is the phase
+// indicator, and no explicit collision detector exists or is needed.
+func WithRarityOrderedDrain() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("rarity-ordered drain requires a gossipsub router")
+		}
+		gs.rarityDrain = true
+		if gs.rarityAnnounce == nil {
+			gs.rarityAnnounce = make(map[string]*phaseHolderEntry)
+		}
+		return nil
+	}
+}
+
+// WithRarityDrainDelivered switches the drain's rank signal from announcers to delivered
+// evidence: distinct peers that IDONTWANTed the mid — peers known to HOLD it, not merely to
+// offer it. Q64's diagnosis of the announce signal: widely announced says the message is
+// widely *offered*, and deferring its forwards converts them into pulls on the first
+// announcer. Holding is the fact balance actually cares about. Requires
+// WithRarityOrderedDrain first.
+func WithRarityDrainDelivered() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("delivered rarity signal requires a gossipsub router")
+		}
+		if !gs.rarityDrain {
+			return fmt.Errorf("delivered rarity signal requires WithRarityOrderedDrain first")
+		}
+		gs.rarityHold = make(map[string]*phaseHolderEntry)
+		return nil
+	}
+}
+
+// noteRarityHolder records that p evidenced holding mid (IDONTWANT-fed).
+func (gs *GossipSubRouter) noteRarityHolder(mid string, p peer.ID) {
+	if gs.rarityHold == nil {
+		return
+	}
+	e, ok := gs.rarityHold[mid]
+	if !ok {
+		e = &phaseHolderEntry{peers: make(map[peer.ID]struct{}), added: time.Now()}
+		gs.rarityHold[mid] = e
+	}
+	e.peers[p] = struct{}{}
+}
+
+// drainRank computes the enqueue-time rank for a normal-lane RPC: 1 + the fewest evidenced
+// holders (delivered signal, when enabled) or announcers among its messages.
+func (gs *GossipSubRouter) drainRank(rpc *RPC) int {
+	msgs := rpc.GetPublish()
+	if len(msgs) == 0 {
+		return 0
+	}
+	best := int(^uint(0) >> 1)
+	for _, m := range msgs {
+		mid := gs.p.idGen.RawID(m)
+		var c int
+		if gs.rarityHold != nil {
+			if e, ok := gs.rarityHold[mid]; ok {
+				c = len(e.peers)
+			}
+		} else {
+			c = gs.rarityCount(mid)
+		}
+		if c < best {
+			best = c
+		}
+	}
+	return 1 + best
+}
+
+// WithPullBudget caps the number of concurrently outstanding pulled ids at n, across all
+// peers. Distinct from WithIWantBudget, which is upstream #625's per-id retry budget per
+// heartbeat (Q23: a no-op at default) — this is BitTorrent-style pipeline depth: with a
+// binding budget, which candidate gets a slot is a real allocation, which is what gives
+// rarest-first pull something to decide. Outstanding entries clear on delivery and expire on
+// the discipline window (1 s when no discipline is set), so a wedged sender cannot leak slots.
+func WithPullBudget(n int) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("pull budget requires a gossipsub router")
+		}
+		if n <= 0 {
+			return fmt.Errorf("pull budget must be positive")
+		}
+		gs.pullBudgetMax = n
+		gs.pullOutstanding = make(map[string]time.Time)
+		return nil
+	}
+}
+
+// WithOfferTable makes the IWANT discipline remember every announcement instead of discarding
+// the ones it cannot act on: offers for unseen ids go into a standing table (announcer, time,
+// topic), every granted ask arms a retry timer one window later, and the retry re-asks the best
+// untried announcer from the table — cycling to the least-recently-tried when all are spent, so
+// a slow honest server gets a second lap. Parks and the request gate filter at pick time;
+// delivery prunes the id everywhere. This is state, not a queue: announcements are facts about
+// who holds what, and in a protocol whose relays announce once, forgetting them is what turned
+// the discipline into the withholding adversary's capture lever (Q70/Q72). Requires
+// WithIWantDiscipline.
+func WithOfferTable(retries *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("offer table requires a gossipsub router")
+		}
+		if gs.iwantAsked == nil {
+			return fmt.Errorf("offer table requires WithIWantDiscipline first")
+		}
+		gs.offerTable = make(map[string]map[peer.ID]time.Time)
+		gs.offerTried = make(map[string]map[peer.ID]time.Time)
+		gs.offerTopic = make(map[string]string)
+		gs.offerByPeer = make(map[peer.ID]int)
+		gs.offerRetryCtr = retries
+		return nil
+	}
+}
+
+// Per-peer and per-id bounds on the offer table. A peer beyond its budget stops being
+// recorded (in production that refusal is the scoreable anomaly — ~70 peers x 256 entries
+// is ~1 MB worst case); a single id keeps at most offerPerID announcers. Entries also age
+// out (offerTTL, swept from the heartbeat), so fabricated never-delivered ids cannot
+// accumulate: without the TTL a junk flood would eventually trip a global guard and
+// silently blind the table for honest offers — a policy attack, not a memory one.
+const (
+	offerPerPeer = 256
+	offerPerID   = 16
+	offerTTL     = 30 * time.Second
+)
+
+// recordOffer notes that peer p announced mid; a fact, kept until delivery or expiry.
+func (gs *GossipSubRouter) recordOffer(mid, topic string, p peer.ID) {
+	if gs.offerTable == nil || gs.p.seenMessage(mid) {
+		return
+	}
+	if gs.offerByPeer[p] >= offerPerPeer {
+		return
+	}
+	peers := gs.offerTable[mid]
+	if peers == nil {
+		peers = make(map[peer.ID]time.Time)
+		gs.offerTable[mid] = peers
+		gs.offerTopic[mid] = topic
+	} else if len(peers) >= offerPerID {
+		if _, known := peers[p]; !known {
+			return
+		}
+	}
+	if _, known := peers[p]; !known {
+		gs.offerByPeer[p]++
+	}
+	peers[p] = time.Now()
+}
+
+// clearOffers forgets a delivered id.
+func (gs *GossipSubRouter) clearOffers(mid string) {
+	if gs.offerTable == nil {
+		return
+	}
+	for p := range gs.offerTable[mid] {
+		if gs.offerByPeer[p] > 0 {
+			gs.offerByPeer[p]--
+		}
+	}
+	delete(gs.offerTable, mid)
+	delete(gs.offerTried, mid)
+	delete(gs.offerTopic, mid)
+}
+
+// sweepOffers ages out stale offers; called from the heartbeat sweep.
+func (gs *GossipSubRouter) sweepOffers() {
+	if gs.offerTable == nil {
+		return
+	}
+	for mid, peers := range gs.offerTable {
+		for p, at := range peers {
+			if time.Since(at) >= offerTTL {
+				delete(peers, p)
+				if gs.offerByPeer[p] > 0 {
+					gs.offerByPeer[p]--
+				}
+			}
+		}
+		if len(peers) == 0 {
+			gs.clearOffers(mid)
+		}
+	}
+}
+
+// retryOfferedPull runs on the router goroutine one window after an ask was granted. If the id
+// is still missing and no ask is in flight, it re-asks the best remembered announcer:
+// untried first, then least-recently tried, in deterministic peer order.
+func (gs *GossipSubRouter) retryOfferedPull(mid string) {
+	if gs.offerTable == nil {
+		return
+	}
+	if gs.p.seenMessage(mid) {
+		gs.clearOffers(mid)
+		return
+	}
+	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
+		return // an ask is in flight; its own retry timer will fire
+	}
+	offers := gs.offerTable[mid]
+	if len(offers) == 0 {
+		return
+	}
+	cands := make([]peer.ID, 0, len(offers))
+	for p := range offers {
+		if gs.peerParked(p) {
+			continue
+		}
+		if gs.requestGate != nil && !gs.requestGate.Allow(p, gs.offerTopic[mid], mid) {
+			continue
+		}
+		cands = append(cands, p)
+	}
+	if len(cands) == 0 {
+		return
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
+	tried := gs.offerTried[mid]
+	pick, found := peer.ID(""), false
+	var oldest time.Time
+	for _, p := range cands {
+		t, was := tried[p]
+		if !was {
+			pick, found = p, true
+			break
+		}
+		if !found || t.Before(oldest) {
+			pick, found, oldest = p, true, t
+		}
+	}
+	if !found || !gs.iwantAllowed(mid, pick) {
+		return
+	}
+	if gs.offerRetryCtr != nil {
+		gs.offerRetryCtr.Add(1)
+	}
+	gs.iasked[pick]++
+	gs.gossipTracer.AddPromise(pick, []string{mid})
+	gs.noteIWantSent(pick, []string{mid})
+	if gs.requestGate != nil {
+		gs.requestGate.Committed(pick, []string{mid})
+	}
+	gs.sendRPC(pick, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{mid}}}, nil, nil, nil), false)
+}
+
+// WithPullMemory keeps the offers the IWANT discipline could not act on (today they are
+// dropped: relays announce once, so a blocked offer is usually gone for good) and re-drives
+// them whenever a slot frees — delivery, window expiry (heartbeat sweep) or an enforcement
+// refund. The re-drive path honors the request gate, the discipline window and parks. Distinct
+// from WithPullBudget, which caps concurrency; memory changes only what is remembered.
+func WithPullMemory(redrives *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("pull memory requires a gossipsub router")
+		}
+		gs.pullMemory = true
+		gs.redriveCtr = redrives
+		if gs.pullOutstanding == nil {
+			gs.pullOutstanding = make(map[string]time.Time)
+		}
+		return nil
+	}
+}
+
+// pullCandidate is a budget-declined pull, kept for re-drive.
+type pullCandidate struct {
+	mid   string
+	topic string
+	from  peer.ID
+}
+
+// pullBacklogCap bounds the backlog; oldest entries drop first.
+const pullBacklogCap = 1024
+
+// backlogPulls stores the candidates the budget could not admit, in the order given (rarity
+// order when rarest-first is on), skipping anything already taken or seen.
+func (gs *GossipSubRouter) backlogPulls(mids []string, topicOf map[string]string, from peer.ID, taken map[string]struct{}) {
+	for _, mid := range mids {
+		if _, ok := taken[mid]; ok {
+			continue
+		}
+		if gs.p.seenMessage(mid) {
+			continue
+		}
+		gs.pullBacklog = append(gs.pullBacklog, pullCandidate{mid: mid, topic: topicOf[mid], from: from})
+	}
+	if n := len(gs.pullBacklog) - pullBacklogCap; n > 0 {
+		gs.pullBacklog = append(gs.pullBacklog[:0:0], gs.pullBacklog[n:]...)
+	}
+}
+
+// redrivePulls issues IWANTs from the backlog while budget slots are free. Called on delivery
+// (a delivery is what frees a slot) — this is the internal retry that keeps a binding budget
+// from taxing the tail with a wait for an external re-offer. Prototype scope: it consults the
+// request gate and the discipline window but bypasses the other request policies, and it asks
+// the peer that announced the id when it was backlogged.
+func (gs *GossipSubRouter) redrivePulls() {
+	if (gs.pullBudgetMax <= 0 && !gs.pullMemory) || len(gs.pullBacklog) == 0 {
+		return
+	}
+	remaining := 64 // memory-only: per-call work bound; iwantAllowed still gates per id
+	if gs.pullBudgetMax > 0 {
+		remaining = gs.pullBudgetMax - gs.pullOutstandingLive()
+	}
+	if remaining <= 0 {
+		return
+	}
+	// Rarity is re-evaluated at re-drive, not frozen at backlog time: the estimate moves
+	// while entries wait, and a freed slot should go to what is rare *now*. Stable, so FIFO
+	// survives within a rarity class; gated on rarest-first so a budget alone keeps arrival
+	// order rather than importing rarity policy through the back door. O(n log n) over a
+	// capped backlog per re-drive — prototype-fine; a production form wants a lazy bucket
+	// queue keyed on the announcer count.
+	if gs.rarestFirst {
+		sort.SliceStable(gs.pullBacklog, func(a, b int) bool {
+			return gs.rarityCount(gs.pullBacklog[a].mid) < gs.rarityCount(gs.pullBacklog[b].mid)
+		})
+	}
+	perPeer := make(map[peer.ID][]string)
+	keep := gs.pullBacklog[:0:0]
+	scanned := 0
+	for remaining > 0 && scanned < len(gs.pullBacklog) {
+		c := gs.pullBacklog[scanned]
+		scanned++
+		if gs.p.seenMessage(c.mid) {
+			continue // delivered: drop for good
+		}
+		if gs.requestGate != nil && !gs.requestGate.Allow(c.from, c.topic, c.mid) {
+			continue // gate refusal is final for this candidate
+		}
+		if gs.peerParked(c.from) {
+			continue // parked announcer: never re-ask
+		}
+		if _, out := gs.pullOutstanding[c.mid]; out {
+			keep = append(keep, c) // id in flight elsewhere: not eligible NOW, keep the offer
+			continue
+		}
+		if !gs.iwantAllowed(c.mid, c.from) {
+			keep = append(keep, c) // window still open: keep the offer for the next re-drive
+			continue
+		}
+		perPeer[c.from] = append(perPeer[c.from], c.mid)
+		gs.pullOutstanding[c.mid] = time.Now()
+		if gs.redriveCtr != nil {
+			gs.redriveCtr.Add(1)
+		}
+		remaining--
+	}
+	gs.pullBacklog = append(keep, gs.pullBacklog[scanned:]...)
+	for p, mids := range perPeer {
+		gs.iasked[p] += len(mids)
+		gs.gossipTracer.AddPromise(p, mids)
+		gs.noteIWantSent(p, mids)
+		if gs.requestGate != nil {
+			gs.requestGate.Committed(p, mids)
+		}
+		gs.sendRPC(p, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: mids}}, nil, nil, nil), false)
+	}
+}
+
+// pullOutstandingLive sweeps expired entries and reports the live outstanding count.
+func (gs *GossipSubRouter) pullOutstandingLive() int {
+	window := gs.iwantWindow
+	if window <= 0 {
+		window = time.Second
+	}
+	for mid, at := range gs.pullOutstanding {
+		if time.Since(at) >= window {
+			delete(gs.pullOutstanding, mid)
+		}
+	}
+	return len(gs.pullOutstanding)
+}
+
+// noteRarityAnnouncer records that p announced mid, for the rarest-first estimate.
+func (gs *GossipSubRouter) noteRarityAnnouncer(mid string, p peer.ID) {
+	if gs.rarityAnnounce == nil {
+		return
+	}
+	e, ok := gs.rarityAnnounce[mid]
+	if !ok {
+		e = &phaseHolderEntry{peers: make(map[peer.ID]struct{}), added: time.Now()}
+		gs.rarityAnnounce[mid] = e
+	}
+	e.peers[p] = struct{}{}
+}
+
+// rarityCount reports how many distinct peers have announced mid.
+func (gs *GossipSubRouter) rarityCount(mid string) int {
+	e, ok := gs.rarityAnnounce[mid]
+	if !ok {
+		return 0
+	}
+	return len(e.peers)
 }
 
 // --- Application request gate ---
@@ -1299,6 +2251,7 @@ func (gs *GossipSubRouter) replayDeferred() {
 		}
 		gs.iasked[pid] += len(lst)
 		gs.gossipTracer.AddPromise(pid, lst)
+		gs.noteIWantSent(pid, lst)
 		gs.requestGate.Committed(pid, lst)
 		gs.sendRPC(pid, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: lst}}, nil, nil, nil), false)
 		for _, mid := range lst {

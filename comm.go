@@ -122,6 +122,14 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 
 	r := msgio.NewVarintReaderSize(s, p.maxMessageSize)
 	for {
+		if p.readDelay > 0 {
+			select {
+			case <-time.After(p.readDelay):
+			case <-p.ctx.Done():
+				s.Reset()
+				return
+			}
+		}
 		// Peek at the message length to know when we should mark the start time
 		// for measuring how long it took to receive a message.
 		_, _ = r.NextMsgLen()
@@ -263,7 +271,9 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 			return err
 		}
 
+		wt := time.Now()
 		_, err = s.Write(out)
+		outgoing.noteWrite(time.Since(wt))
 		if err != nil {
 			p.rpcLogger.Debug("failed to send message", "peer", s.Conn().RemotePeer(), "rpc", rpc, "err", err)
 			return err
