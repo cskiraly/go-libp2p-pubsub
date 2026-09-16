@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -46,7 +47,7 @@ func TestPhaseForwardingTrim(t *testing.T) {
 		pf := &phaseForwarding{degree: 3}
 		gmap := mesh(8)
 		ts := tosend(gmap, direct)
-		announce := pf.trim(newRouter(), mid, csum, gmap, ts)
+		announce := pf.trim(newRouter(), nil, mid, csum, gmap, ts)
 		if len(announce) != 5 {
 			t.Fatalf("announced %d peers, want 5", len(announce))
 		}
@@ -66,7 +67,7 @@ func TestPhaseForwardingTrim(t *testing.T) {
 		ts := tosend(gmap)
 		delete(ts, peer.ID("mesh-00"))
 		delete(ts, peer.ID("mesh-01"))
-		announce := pf.trim(gs, mid, csum, gmap, ts)
+		announce := pf.trim(gs, nil, mid, csum, gmap, ts)
 		if len(ts) != 1 {
 			t.Fatalf("pushing to %d peers, want degree 3 minus 2 holders = 1", len(ts))
 		}
@@ -82,7 +83,7 @@ func TestPhaseForwardingTrim(t *testing.T) {
 		ts := tosend(gmap)
 		delete(ts, peer.ID("mesh-00"))
 		delete(ts, peer.ID("mesh-01"))
-		announce := pf.trim(gs, mid, csum, gmap, ts)
+		announce := pf.trim(gs, nil, mid, csum, gmap, ts)
 		if len(ts) != 0 || len(announce) != 2 {
 			t.Fatalf("push %d / announce %d, want 0 / 2", len(ts), len(announce))
 		}
@@ -92,8 +93,31 @@ func TestPhaseForwardingTrim(t *testing.T) {
 		pf := &phaseForwarding{degree: 8}
 		gmap := mesh(4)
 		ts := tosend(gmap)
-		if announce := pf.trim(newRouter(), mid, csum, gmap, ts); announce != nil {
+		if announce := pf.trim(newRouter(), nil, mid, csum, gmap, ts); announce != nil {
 			t.Fatalf("announced %d peers with a budget covering the mesh", len(announce))
+		}
+	})
+
+	t.Run("the degree may follow the message", func(t *testing.T) {
+		// One byte of body per pushed peer: a 3-byte message is pushed to 3 of 8, a 0-byte
+		// one to none, and a function that says less than nothing is floored at zero.
+		pf := &phaseForwarding{degreeOf: func(m *Message) int { return len(m.GetData()) - 1 }}
+		gmap := mesh(8)
+		for _, tc := range []struct {
+			body      int
+			wantPush  int
+			wantAnnce int
+		}{
+			{body: 4, wantPush: 3, wantAnnce: 5},
+			{body: 1, wantPush: 0, wantAnnce: 8},
+			{body: 0, wantPush: 0, wantAnnce: 8},
+		} {
+			msg := &Message{Message: &pb.Message{Data: make([]byte, tc.body)}}
+			ts := tosend(gmap)
+			announce := pf.trim(newRouter(), msg, mid, csum, gmap, ts)
+			if len(ts) != tc.wantPush || len(announce) != tc.wantAnnce {
+				t.Fatalf("body %d: push %d / announce %d, want %d / %d", tc.body, len(ts), len(announce), tc.wantPush, tc.wantAnnce)
+			}
 		}
 	})
 
@@ -102,7 +126,7 @@ func TestPhaseForwardingTrim(t *testing.T) {
 		gmap := mesh(8)
 		pushed := func(id string) map[peer.ID]struct{} {
 			ts := tosend(gmap)
-			pf.trim(newRouter(), id, computeChecksum(id), gmap, ts)
+			pf.trim(newRouter(), nil, id, computeChecksum(id), gmap, ts)
 			return ts
 		}
 		a, b := pushed("m1"), pushed("m1")

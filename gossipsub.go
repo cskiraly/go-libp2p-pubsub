@@ -1506,7 +1506,7 @@ func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 			}
 
 			if gs.phaseForward != nil && gs.phaseForward.match(topic) {
-				announce = gs.phaseForward.trim(gs, mid, csum, gmap, tosend)
+				announce = gs.phaseForward.trim(gs, msg, mid, csum, gmap, tosend)
 			}
 		}
 

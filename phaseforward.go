@@ -28,6 +28,8 @@ import (
 type phaseForwarding struct {
 	match  func(topic string) bool
 	degree int
+	// degreeOf, when set, decides the degree per message and overrides degree.
+	degreeOf func(msg *Message) int
 }
 
 // WithPhaseForwarding enables the phase transition on every topic the matcher accepts.
@@ -47,17 +49,48 @@ func WithPhaseForwarding(match func(topic string) bool, degree int) Option {
 	}
 }
 
+// WithPhaseForwardingByMessage is WithPhaseForwarding with the degree decided per message.
+// degreeOf sees the validated message about to be forwarded and returns how many mesh peers
+// not known to hold it may be pushed to; a result below zero counts as zero. This is what
+// lets an application push a small payload wide and a large one narrow when the payload's
+// size is written in the message, without a router-wide constant to tune.
+func WithPhaseForwardingByMessage(match func(topic string) bool, degreeOf func(msg *Message) int) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("phase forwarding requires a gossipsub router")
+		}
+		if match == nil || degreeOf == nil {
+			return fmt.Errorf("phase forwarding needs a topic matcher and a degree function")
+		}
+		gs.phaseForward = &phaseForwarding{match: match, degreeOf: degreeOf}
+		return nil
+	}
+}
+
+// degreeFor returns the push degree for msg: the per-message function's answer, floored at
+// zero, or the fixed degree.
+func (pf *phaseForwarding) degreeFor(msg *Message) int {
+	if pf.degreeOf == nil {
+		return pf.degree
+	}
+	if d := pf.degreeOf(msg); d > 0 {
+		return d
+	}
+	return 0
+}
+
 // trim caps the mesh members of tosend at max(0, degree - knownHolders), removing the
 // over-budget ones and returning them, rank-ordered, so the caller can announce to them
 // instead. Peers outside the mesh set (direct and floodsub peers) are never trimmed.
-func (pf *phaseForwarding) trim(gs *GossipSubRouter, mid string, csum checksum, gmap map[peer.ID]struct{}, tosend map[peer.ID]struct{}) []peer.ID {
+func (pf *phaseForwarding) trim(gs *GossipSubRouter, msg *Message, mid string, csum checksum, gmap map[peer.ID]struct{}, tosend map[peer.ID]struct{}) []peer.ID {
 	holders := 0
 	for p := range gmap {
 		if _, ok := gs.unwanted[p][csum]; ok {
 			holders++
 		}
 	}
-	budget := pf.degree - holders
+	budget := pf.degreeFor(msg) - holders
 	if budget < 0 {
 		budget = 0
 	}
