@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 var (
@@ -13,37 +14,67 @@ var (
 	ErrQueuePushOnClosed = errors.New("push on closed rpc queue")
 )
 
+const (
+	// urgentClass is the queue class of urgent RPCs (e.g. IDONTWANT); it is
+	// always served first.
+	urgentClass = 0
+	// defaultClass is the queue class of every other RPC when no priority
+	// function is configured.
+	defaultClass = 1
+	// MaxTopicPriority is the largest value a TopicPriorityFn may return;
+	// larger values are clamped.
+	MaxTopicPriority = 14
+	numQueueClasses  = defaultClass + MaxTopicPriority + 1
+)
+
+type queuedRPC struct {
+	rpc   *RPC
+	class int
+	at    time.Time
+}
+
+// priorityQueue is a strict priority queue of FIFO classes; class 0 is
+// served first.
 type priorityQueue struct {
-	normal   []*RPC
-	priority []*RPC
+	classes [numQueueClasses][]queuedRPC
+	len     int
 }
 
 func (q *priorityQueue) Len() int {
-	return len(q.normal) + len(q.priority)
+	return q.len
 }
 
-func (q *priorityQueue) NormalPush(rpc *RPC) {
-	q.normal = append(q.normal, rpc)
+func (q *priorityQueue) push(e queuedRPC) {
+	q.classes[e.class] = append(q.classes[e.class], e)
+	q.len++
 }
 
-func (q *priorityQueue) PriorityPush(rpc *RPC) {
-	q.priority = append(q.priority, rpc)
-}
-
-func (q *priorityQueue) Pop() *RPC {
-	var rpc *RPC
-
-	if len(q.priority) > 0 {
-		rpc = q.priority[0]
-		q.priority[0] = nil
-		q.priority = q.priority[1:]
-	} else if len(q.normal) > 0 {
-		rpc = q.normal[0]
-		q.normal[0] = nil
-		q.normal = q.normal[1:]
+func (q *priorityQueue) Pop() (queuedRPC, bool) {
+	for c := range q.classes {
+		if len(q.classes[c]) > 0 {
+			e := q.classes[c][0]
+			q.classes[c][0] = queuedRPC{}
+			q.classes[c] = q.classes[c][1:]
+			q.len--
+			return e, true
+		}
 	}
+	return queuedRPC{}, false
+}
 
-	return rpc
+// evictBelow removes the newest RPC of the lowest-priority non-empty class
+// that is strictly below class, if there is one.
+func (q *priorityQueue) evictBelow(class int) (*RPC, bool) {
+	for c := len(q.classes) - 1; c > class; c-- {
+		if n := len(q.classes[c]); n > 0 {
+			rpc := q.classes[c][n-1].rpc
+			q.classes[c][n-1] = queuedRPC{}
+			q.classes[c] = q.classes[c][:n-1]
+			q.len--
+			return rpc, true
+		}
+	}
+	return nil, false
 }
 
 type rpcQueue struct {
@@ -65,14 +96,23 @@ func newRpcQueue(maxSize int) *rpcQueue {
 }
 
 func (q *rpcQueue) Push(rpc *RPC, block bool) error {
-	return q.push(rpc, false, block)
+	_, err := q.push(rpc, defaultClass, false, block)
+	return err
 }
 
 func (q *rpcQueue) UrgentPush(rpc *RPC, block bool) error {
-	return q.push(rpc, true, block)
+	_, err := q.push(rpc, urgentClass, false, block)
+	return err
 }
 
-func (q *rpcQueue) push(rpc *RPC, urgent bool, block bool) error {
+// PushClass enqueues rpc in the given class. When the queue is full and evict
+// is set, the newest RPC of the lowest class below class is dropped to make
+// room and returned; otherwise a full queue fails with ErrQueueFull (or blocks).
+func (q *rpcQueue) PushClass(rpc *RPC, class int, evict bool, block bool) (*RPC, error) {
+	return q.push(rpc, class, evict, block)
+}
+
+func (q *rpcQueue) push(rpc *RPC, class int, evict bool, block bool) (*RPC, error) {
 	q.queueMu.Lock()
 	defer q.queueMu.Unlock()
 
@@ -80,7 +120,14 @@ func (q *rpcQueue) push(rpc *RPC, urgent bool, block bool) error {
 		panic(ErrQueuePushOnClosed)
 	}
 
-	for q.queue.Len() == q.maxSize {
+	var evicted *RPC
+	for q.queue.Len() >= q.maxSize {
+		if evict {
+			if e, ok := q.queue.evictBelow(class); ok {
+				evicted = e
+				continue
+			}
+		}
 		if block {
 			q.spaceAvailable.Wait()
 			// It can receive a signal because the queue is closed.
@@ -88,28 +135,29 @@ func (q *rpcQueue) push(rpc *RPC, urgent bool, block bool) error {
 				panic(ErrQueuePushOnClosed)
 			}
 		} else {
-			return ErrQueueFull
+			return nil, ErrQueueFull
 		}
 	}
-	if urgent {
-		q.queue.PriorityPush(rpc)
-	} else {
-		q.queue.NormalPush(rpc)
-	}
+	q.queue.push(queuedRPC{rpc: rpc, class: class, at: time.Now()})
 
 	q.dataAvailable.Signal()
-	return nil
+	return evicted, nil
 }
 
 // Note that, when the queue is empty and there are two blocked Pop calls, it
 // doesn't mean that the first Pop will get the item from the next Push. The
 // second Pop will probably get it instead.
 func (q *rpcQueue) Pop(ctx context.Context) (*RPC, error) {
+	e, err := q.pop(ctx)
+	return e.rpc, err
+}
+
+func (q *rpcQueue) pop(ctx context.Context) (queuedRPC, error) {
 	q.queueMu.Lock()
 	defer q.queueMu.Unlock()
 
 	if q.closed {
-		return nil, ErrQueueClosed
+		return queuedRPC{}, ErrQueueClosed
 	}
 
 	unregisterAfterFunc := context.AfterFunc(ctx, func() {
@@ -123,18 +171,18 @@ func (q *rpcQueue) Pop(ctx context.Context) (*RPC, error) {
 	for q.queue.Len() == 0 {
 		select {
 		case <-ctx.Done():
-			return nil, ErrQueueCancelled
+			return queuedRPC{}, ErrQueueCancelled
 		default:
 		}
 		q.dataAvailable.Wait()
 		// It can receive a signal because the queue is closed.
 		if q.closed {
-			return nil, ErrQueueClosed
+			return queuedRPC{}, ErrQueueClosed
 		}
 	}
-	rpc := q.queue.Pop()
+	e, _ := q.queue.Pop()
 	q.spaceAvailable.Signal()
-	return rpc, nil
+	return e, nil
 }
 
 func (q *rpcQueue) Close() {

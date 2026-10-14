@@ -254,3 +254,64 @@ func TestRpcQueueCancelPop(t *testing.T) {
 		}
 	})
 }
+
+func TestRpcQueuePushClassOrder(t *testing.T) {
+	synctestTest(t, func(t *testing.T) {
+		q := newRpcQueue(32)
+		low1, high, low2, urgent, mid := &RPC{}, &RPC{}, &RPC{}, &RPC{}, &RPC{}
+		q.PushClass(low1, defaultClass+5, true, false)
+		q.PushClass(high, defaultClass, true, false)
+		q.PushClass(low2, defaultClass+5, true, false)
+		q.UrgentPush(urgent, false)
+		q.PushClass(mid, defaultClass+2, true, false)
+		for i, want := range []*RPC{urgent, high, mid, low1, low2} {
+			got, err := q.Pop(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				t.Fatalf("pop %d: got the wrong rpc", i)
+			}
+		}
+	})
+}
+
+func TestRpcQueuePushClassEvicts(t *testing.T) {
+	synctestTest(t, func(t *testing.T) {
+		q := newRpcQueue(3)
+		lowOld, lowNew, mid := &RPC{}, &RPC{}, &RPC{}
+		q.PushClass(lowOld, defaultClass+3, true, false)
+		q.PushClass(mid, defaultClass+1, true, false)
+		q.PushClass(lowNew, defaultClass+3, true, false)
+
+		// A full queue evicts the newest RPC of the lowest lower class.
+		high := &RPC{}
+		evicted, err := q.PushClass(high, defaultClass, true, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if evicted != lowNew {
+			t.Fatal("expected the newest low priority rpc to be evicted")
+		}
+
+		// Nothing below its own class: the RPC is refused, as without eviction.
+		evicted, err = q.PushClass(&RPC{}, defaultClass+3, true, false)
+		if err != ErrQueueFull || evicted != nil {
+			t.Fatalf("expected ErrQueueFull and no eviction, got %v, %v", err, evicted)
+		}
+		// Same class is not evicted either.
+		if _, err = q.PushClass(&RPC{}, defaultClass+1, false, false); err != ErrQueueFull {
+			t.Fatalf("expected ErrQueueFull without eviction, got %v", err)
+		}
+
+		for i, want := range []*RPC{high, mid, lowOld} {
+			got, err := q.Pop(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				t.Fatalf("pop %d: got the wrong rpc", i)
+			}
+		}
+	})
+}

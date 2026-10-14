@@ -1604,9 +1604,16 @@ func (gs *GossipSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
 
 func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, urgent bool) {
 	var err error
-	if urgent {
+	switch {
+	case urgent:
 		err = q.UrgentPush(rpc, false)
-	} else {
+	case gs.p.topicPriority != nil:
+		var evicted *RPC
+		evicted, err = q.PushClass(rpc, gs.rpcClass(rpc), true, false)
+		if evicted != nil {
+			gs.doDropRPC(evicted, p, "evicted by a higher priority RPC")
+		}
+	default:
 		err = q.Push(rpc, false)
 	}
 	if err != nil {
@@ -1614,6 +1621,26 @@ func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, urgent bo
 		return
 	}
 	gs.tracer.SendRPC(rpc, p)
+}
+
+// rpcClass is the outbound queue class of a non-urgent RPC under
+// WithTopicPriority: that of its highest-priority message (a partial message
+// counts as a message of its topic), or the highest class if it carries only
+// control messages.
+func (gs *GossipSubRouter) rpcClass(rpc *RPC) int {
+	msgs := rpc.GetPublish()
+	partial := rpc.GetPartial()
+	if len(msgs) == 0 && partial == nil {
+		return defaultClass
+	}
+	prio := MaxTopicPriority
+	for _, msg := range msgs {
+		prio = min(prio, max(0, gs.p.topicPriority(msg.GetTopic())))
+	}
+	if partial != nil {
+		prio = min(prio, max(0, gs.p.topicPriority(partial.GetTopicID())))
+	}
+	return defaultClass + prio
 }
 
 func (gs *GossipSubRouter) heartbeatTimer() {

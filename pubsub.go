@@ -95,6 +95,13 @@ type PubSub struct {
 	// size of the outbound message channel that we maintain for each peer
 	peerOutboundQueueSize int
 
+	// topicPriority, when set, assigns outbound RPCs to priority classes by
+	// topic (see WithTopicPriority).
+	topicPriority TopicPriorityFn
+
+	// outboundObserver, when set, is called for every RPC written to a peer.
+	outboundObserver OutboundRPCObserver
+
 	// incoming messages from other peers
 	incoming chan incomingUnion
 
@@ -751,6 +758,54 @@ func WithPeerOutboundQueueSize(size int) Option {
 			return errors.New("outbound queue size must always be positive")
 		}
 		p.peerOutboundQueueSize = size
+		return nil
+	}
+}
+
+// TopicPriorityFn maps a topic to an outbound priority: 0 is the highest
+// priority, larger values are lower (clamped to MaxTopicPriority).
+type TopicPriorityFn func(topic string) int
+
+// WithTopicPriority makes each peer's outbound queue a strict priority queue:
+// an RPC carrying messages is queued in the class of its highest-priority
+// message, and RPCs carrying only control messages in the highest class
+// (urgent control messages such as IDONTWANT still go before all of them).
+// When a peer's queue is full, an RPC evicts the newest queued RPC of a lower
+// class instead of being dropped. Without this option, outbound queues are
+// FIFO (apart from the urgent lane) and drop the incoming RPC when full.
+func WithTopicPriority(fn TopicPriorityFn) Option {
+	return func(p *PubSub) error {
+		p.topicPriority = fn
+		return nil
+	}
+}
+
+// OutboundRPCInfo describes an RPC written to a peer's stream.
+type OutboundRPCInfo struct {
+	Peer peer.ID
+	// Class is the queue class the RPC waited in: 0 for urgent RPCs, 1 +
+	// topic priority for the others (1 for all of them without
+	// WithTopicPriority).
+	Class int
+	// Topic is the topic of the RPC's first message or of its partial
+	// message, or "" if it carries neither.
+	Topic string
+	Size  int
+	// QueueWait is the time from enqueueing to dequeueing the RPC, and
+	// WriteTime the time the stream write took.
+	QueueWait time.Duration
+	WriteTime time.Duration
+}
+
+// OutboundRPCObserver is called from the per-peer sending goroutines after
+// each RPC write; it must be fast and safe for concurrent use.
+type OutboundRPCObserver func(OutboundRPCInfo)
+
+// WithOutboundRPCObserver sets a function to be called for every RPC written
+// to a peer, for instrumentation of the outbound queues.
+func WithOutboundRPCObserver(fn OutboundRPCObserver) Option {
+	return func(p *PubSub) error {
+		p.outboundObserver = fn
 		return nil
 	}
 }

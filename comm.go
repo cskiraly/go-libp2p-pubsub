@@ -260,13 +260,29 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 
 	defer s.Close()
 	for ctx.Err() == nil {
-		rpc, err := outgoing.Pop(ctx)
+		e, err := outgoing.pop(ctx)
 		if err != nil {
 			p.logger.Debug("error popping message from the queue to send to peer", "peer", s.Conn().RemotePeer(), "err", err)
 			return
 		}
 
-		err = writeRpc(rpc)
+		popped := time.Now()
+		err = writeRpc(e.rpc)
+		if err == nil && p.outboundObserver != nil {
+			info := OutboundRPCInfo{
+				Peer:      s.Conn().RemotePeer(),
+				Class:     e.class,
+				Size:      proto.Size(&e.rpc.RPC),
+				QueueWait: popped.Sub(e.at),
+				WriteTime: time.Since(popped),
+			}
+			if msgs := e.rpc.GetPublish(); len(msgs) > 0 {
+				info.Topic = msgs[0].GetTopic()
+			} else if partial := e.rpc.GetPartial(); partial != nil {
+				info.Topic = partial.GetTopicID()
+			}
+			p.outboundObserver(info)
+		}
 		if err != nil {
 			s.Reset()
 			p.logger.Debug("error writing message to peer", "peer", s.Conn().RemotePeer(), "err", err)
