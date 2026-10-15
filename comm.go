@@ -266,8 +266,14 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 			return
 		}
 
+		if p.uplinkGate != nil {
+			p.uplinkGate.wait(ctx, e.class, outgoing.classCounts)
+		}
 		popped := time.Now()
 		err = writeRpc(e.rpc)
+		if p.uplinkGate != nil {
+			p.uplinkGate.done(e.class)
+		}
 		if err == nil && p.outboundObserver != nil {
 			info := OutboundRPCInfo{
 				Peer:      s.Conn().RemotePeer(),

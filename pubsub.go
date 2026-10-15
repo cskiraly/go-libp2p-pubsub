@@ -101,6 +101,7 @@ type PubSub struct {
 
 	// outboundObserver, when set, is called for every RPC written to a peer.
 	outboundObserver OutboundRPCObserver
+	uplinkGate       *uplinkGate
 
 	// incoming messages from other peers
 	incoming chan incomingUnion
@@ -810,6 +811,23 @@ func WithOutboundRPCObserver(fn OutboundRPCObserver) Option {
 	}
 }
 
+// WithUplinkPriority makes the topic priority classes (see WithTopicPriority)
+// apply across peers: an RPC waits, up to maxWait, while an RPC of a higher
+// class is queued or being written for any other peer. Without it, each peer's
+// queue is ordered on its own and the peers' writers share the uplink.
+func WithUplinkPriority(maxWait time.Duration) Option {
+	return func(p *PubSub) error {
+		p.uplinkGate = newUplinkGate(maxWait)
+		return nil
+	}
+}
+
+func (p *PubSub) newPeerQueue() *rpcQueue {
+	q := newRpcQueue(p.peerOutboundQueueSize)
+	q.gate = p.uplinkGate
+	return q
+}
+
 // WithMessageSignaturePolicy sets the mode of operation for producing and verifying message signatures.
 func WithMessageSignaturePolicy(policy MessageSignaturePolicy) Option {
 	return func(p *PubSub) error {
@@ -1170,7 +1188,7 @@ func (p *PubSub) handlePendingPeers() {
 			continue
 		}
 
-		rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
+		rpcQueue := p.newPeerQueue()
 		p.peers[pid] = rpcQueue
 		go p.handleNewPeer(p.ctx, pid, rpcQueue)
 	}
@@ -1229,7 +1247,7 @@ func (p *PubSub) handleDeadPeers() {
 			// still connected, must be a duplicate connection being closed.
 			// we respawn the writer as we need to ensure there is a stream active
 			p.logger.Debug("peer declared dead but still connected; respawning writer", "peer", pid)
-			rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
+			rpcQueue := p.newPeerQueue()
 			p.peers[pid] = rpcQueue
 			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, rpcQueue)
 		}

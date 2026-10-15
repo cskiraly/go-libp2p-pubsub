@@ -64,17 +64,17 @@ func (q *priorityQueue) Pop() (queuedRPC, bool) {
 
 // evictBelow removes the newest RPC of the lowest-priority non-empty class
 // that is strictly below class, if there is one.
-func (q *priorityQueue) evictBelow(class int) (*RPC, bool) {
+func (q *priorityQueue) evictBelow(class int) (queuedRPC, bool) {
 	for c := len(q.classes) - 1; c > class; c-- {
 		if n := len(q.classes[c]); n > 0 {
-			rpc := q.classes[c][n-1].rpc
+			e := q.classes[c][n-1]
 			q.classes[c][n-1] = queuedRPC{}
 			q.classes[c] = q.classes[c][:n-1]
 			q.len--
-			return rpc, true
+			return e, true
 		}
 	}
-	return nil, false
+	return queuedRPC{}, false
 }
 
 type rpcQueue struct {
@@ -86,6 +86,8 @@ type rpcQueue struct {
 
 	closed  bool
 	maxSize int
+	// gate, when set, counts this queue's RPCs in the node-wide uplink gate.
+	gate *uplinkGate
 }
 
 func newRpcQueue(maxSize int) *rpcQueue {
@@ -124,7 +126,10 @@ func (q *rpcQueue) push(rpc *RPC, class int, evict bool, block bool) (*RPC, erro
 	for q.queue.Len() >= q.maxSize {
 		if evict {
 			if e, ok := q.queue.evictBelow(class); ok {
-				evicted = e
+				evicted = e.rpc
+				if q.gate != nil {
+					q.gate.done(e.class)
+				}
 				continue
 			}
 		}
@@ -139,6 +144,9 @@ func (q *rpcQueue) push(rpc *RPC, class int, evict bool, block bool) (*RPC, erro
 		}
 	}
 	q.queue.push(queuedRPC{rpc: rpc, class: class, at: time.Now()})
+	if q.gate != nil {
+		q.gate.add(class)
+	}
 
 	q.dataAvailable.Signal()
 	return evicted, nil
@@ -185,10 +193,27 @@ func (q *rpcQueue) pop(ctx context.Context) (queuedRPC, error) {
 	return e, nil
 }
 
+// classCounts returns the number of queued RPCs per class.
+func (q *rpcQueue) classCounts() (n [numQueueClasses]int) {
+	q.queueMu.Lock()
+	defer q.queueMu.Unlock()
+	for c := range q.queue.classes {
+		n[c] = len(q.queue.classes[c])
+	}
+	return n
+}
+
 func (q *rpcQueue) Close() {
 	q.queueMu.Lock()
 	defer q.queueMu.Unlock()
 
+	if q.gate != nil && !q.closed {
+		for c := range q.queue.classes {
+			for range q.queue.classes[c] {
+				q.gate.done(c)
+			}
+		}
+	}
 	q.closed = true
 	q.dataAvailable.Broadcast()
 	q.spaceAvailable.Broadcast()
